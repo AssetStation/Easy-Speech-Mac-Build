@@ -1,9 +1,0 @@
-# Easy Speech - Standalone Engine Build Requirements
-kokoro-onnx>=0.6.0
-piper-tts>=1.8.0
-onnxruntime>=1.16.0
-soundfile>=0.12.0
-numpy>=1.24.0,<3
-phonemizer>=3.2.0
-espeakng-loader>=0.2.4
-pyinstaller>=6.0.0
