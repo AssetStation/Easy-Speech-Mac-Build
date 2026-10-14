@@ -98,11 +98,12 @@ fi
 
 echo "[*] Upgrading pip, setuptools, and wheel..."
 "$VENV_PYTHON" -m pip install --upgrade pip setuptools wheel
+"$VENV_PYTHON" -m pip install "numpy<2"
 
 # 5. Install PyTorch with native Apple Metal (MPS) support
 echo ""
 echo "[*] Installing PyTorch (with Apple Silicon Metal/MPS support)..."
-"$VENV_PIP" install torch torchvision torchaudio
+"$VENV_PIP" install "torch>=2.5.0" torchvision "torchaudio>=2.5.0"
 
 # 6. Install F5-TTS, Faster-Whisper, and Audio Processing packages
 echo ""
