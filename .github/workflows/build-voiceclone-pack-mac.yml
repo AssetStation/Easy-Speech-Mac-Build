@@ -106,7 +106,7 @@ jobs:
 
   bundle-mac-x64:
     name: macOS Intel (x64) Bundle
-    runs-on: macos-13
+    runs-on: macos-15-intel
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
