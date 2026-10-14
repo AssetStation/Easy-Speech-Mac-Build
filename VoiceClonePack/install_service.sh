@@ -98,7 +98,6 @@ fi
 
 echo "[*] Upgrading pip, setuptools, and wheel..."
 "$VENV_PYTHON" -m pip install --upgrade pip setuptools wheel
-"$VENV_PYTHON" -m pip install "numpy<2"
 
 # 5. Install PyTorch with native Apple Metal (MPS) support
 echo ""
