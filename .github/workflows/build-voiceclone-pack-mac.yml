@@ -107,6 +107,7 @@ jobs:
   bundle-mac-x64:
     name: macOS Intel (x64) Bundle
     runs-on: macos-15-intel
+    continue-on-error: true
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -122,12 +123,20 @@ jobs:
           mv python .venv
           chmod -R +x .venv/bin
 
+      - name: Install System Build Tools (Intel)
+        run: |
+          brew install llvm@14 cmake || true
+          if [ -d "$(brew --prefix llvm@14 2>/dev/null)" ]; then
+            echo "LLVM_CONFIG=$(brew --prefix llvm@14)/bin/llvm-config" >> $GITHUB_ENV
+            echo "$(brew --prefix llvm@14)/bin" >> $GITHUB_PATH
+          fi
+
       - name: Install PyTorch and AI Dependencies
         run: |
           cd build_pack/VoiceClonePack
           ./.venv/bin/python3 -m pip install --upgrade pip setuptools wheel
-          ./.venv/bin/python3 -m pip install torch torchvision torchaudio
-          ./.venv/bin/python3 -m pip install f5-tts faster-whisper soundfile imageio_ffmpeg pydub
+          ./.venv/bin/python3 -m pip install --prefer-binary torch torchvision torchaudio
+          ./.venv/bin/python3 -m pip install --prefer-binary f5-tts faster-whisper soundfile imageio_ffmpeg pydub
 
       - name: Pre-Download AI Model Weights
         if: ${{ github.event.inputs.include_models != 'false' }}
@@ -179,7 +188,7 @@ jobs:
   publish-release:
     name: Publish Release Assets
     needs: [bundle-mac-arm64, bundle-mac-x64]
-    if: ${{ github.event.inputs.publish_release == true || github.event.inputs.publish_release == 'true' }}
+    if: always() && needs.bundle-mac-arm64.result == 'success' && (github.event.inputs.publish_release == true || github.event.inputs.publish_release == 'true')
     runs-on: ubuntu-latest
     steps:
       - name: Download Mac ARM64 Artifact
@@ -189,6 +198,7 @@ jobs:
           merge-multiple: true
 
       - name: Download Mac x64 Artifact
+        continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           name: VoiceClonePack-mac-x64
@@ -199,5 +209,4 @@ jobs:
         with:
           tag_name: ${{ github.event.inputs.tag_name }}
           files: |
-            VoiceClonePack-mac-arm64.zip
-            VoiceClonePack-mac-x64.zip
+            VoiceClonePack-mac-*.zip
