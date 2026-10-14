@@ -82,6 +82,34 @@ except Exception:
 # Global model instances
 kokoro_instance = None
 piper_voices = {}
+f5_instance = None
+
+# Ensure portable ffmpeg in PATH for audio conversion if available
+try:
+    import imageio_ffmpeg
+    _ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
+    _ffmpeg_dir = os.path.dirname(_ffmpeg_bin)
+    if _ffmpeg_dir not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = _ffmpeg_dir + os.path.pathsep + os.environ.get("PATH", "")
+    from pydub import AudioSegment
+    AudioSegment.converter = _ffmpeg_bin
+except Exception:
+    pass
+
+def get_f5_model():
+    global f5_instance
+    if f5_instance is None:
+        try:
+            import torch
+            from f5_tts.api import F5TTS
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            f5_instance = F5TTS(device=device)
+        except ImportError as e:
+            raise RuntimeError(
+                "Voice Cloning dependencies (PyTorch/F5-TTS) are not installed in the base plugin. "
+                "Please run 'start_service.bat' in VoiceClonePack to launch the RTX Voice Clone Service."
+            ) from e
+    return f5_instance
 
 def get_kokoro():
     global kokoro_instance
@@ -114,7 +142,9 @@ def run_cli():
     parser.add_argument("--text", type=str, default="", help="Text to synthesize")
     parser.add_argument("--text-file", type=str, default=None, help="Path to UTF-8 text file containing script")
     parser.add_argument("--voice", type=str, default="af_heart", help="Voice ID")
-    parser.add_argument("--engine", type=str, default="kokoro", choices=["kokoro", "piper"], help="TTS engine")
+    parser.add_argument("--engine", type=str, default="kokoro", choices=["kokoro", "piper", "f5_clone"], help="TTS engine")
+    parser.add_argument("--ref-audio", type=str, default=None, help="Reference audio path for voice cloning")
+    parser.add_argument("--ref-text", type=str, default=None, help="Spoken transcript of reference audio (optional)")
     parser.add_argument("--speed", type=float, default=1.0, help="Speaking speed")
     parser.add_argument("--output", type=str, default=None, help="Explicit output wav path")
     parser.add_argument("--result-json", type=str, default=None, help="Path to write JSON metadata")
@@ -200,6 +230,82 @@ def run_cli():
             sample_rate = chunks[0].sample_rate
             sf.write(output_filepath, all_audio, sample_rate)
             duration = float(len(all_audio)) / float(sample_rate)
+
+        elif args.engine == "f5_clone":
+            ref_audio = args.ref_audio
+            if not ref_audio or not os.path.exists(ref_audio):
+                raise FileNotFoundError(f"Reference audio not found for voice cloning: {ref_audio}")
+
+            # 1. Attempt to delegate to the persistent high-speed RTX daemon (Option A)
+            handled_by_daemon = False
+            try:
+                import urllib.request
+                import json as _json
+                daemon_req = {
+                    "text": text,
+                    "ref_audio": ref_audio,
+                    "ref_text": args.ref_text or "",
+                    "speed": args.speed,
+                    "output_path": output_filepath
+                }
+                req = urllib.request.Request(
+                    "http://127.0.0.1:8765/api/generate",
+                    data=_json.dumps(daemon_req).encode("utf-8"),
+                    headers={"Content-Type": "application/json"}
+                )
+                with urllib.request.urlopen(req, timeout=120) as daemon_resp:
+                    res_obj = _json.loads(daemon_resp.read().decode("utf-8"))
+                    if res_obj.get("success"):
+                        duration = float(res_obj.get("duration", 0.0))
+                        handled_by_daemon = True
+            except Exception:
+                handled_by_daemon = False
+
+            # 2. If daemon is not running, fallback to direct local inference if dependencies are present
+            if not handled_by_daemon:
+                f5 = get_f5_model()
+
+                # Ensure clean 24k wav if non-wav
+                ext = os.path.splitext(ref_audio)[1].lower()
+                clean_ref = ref_audio
+                if ext != ".wav":
+                    try:
+                        import imageio_ffmpeg, subprocess
+                        ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
+                        clean_ref = os.path.splitext(ref_audio)[0] + "_24k.wav"
+                        subprocess.run([ffmpeg_bin, "-y", "-i", ref_audio, "-ar", "24000", "-ac", "1", clean_ref], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    except Exception:
+                        clean_ref = ref_audio
+
+                ref_text = (args.ref_text or "").strip()
+                if not ref_text:
+                    try:
+                        from faster_whisper import WhisperModel
+                        wm = WhisperModel("tiny", device="cpu", compute_type="int8")
+                        segs, _ = wm.transcribe(clean_ref)
+                        ref_text = " ".join([s.text for s in segs]).strip()
+                    except Exception:
+                        ref_text = ""
+
+                import torch
+                with torch.inference_mode():
+                    samples, sample_rate, _ = f5.infer(
+                        ref_file=clean_ref,
+                        ref_text=ref_text,
+                        gen_text=text,
+                        speed=args.speed,
+                        nfe_step=32,
+                        cfg_strength=2.5
+                    )
+
+                if samples is None or len(samples) == 0:
+                    raise RuntimeError("Voice cloning inference returned empty audio.")
+
+                sf.write(output_filepath, samples, sample_rate)
+                duration = float(len(samples)) / float(sample_rate)
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         else:
             raise ValueError(f"Unknown engine: {args.engine}")
 
