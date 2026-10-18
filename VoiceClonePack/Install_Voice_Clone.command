@@ -5,6 +5,8 @@
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/Library/Frameworks/Python.framework/Versions/Current/bin:$PATH"
+
 chmod +x "$SCRIPT_DIR/install_service.sh" "$SCRIPT_DIR/start_service.sh" 2>/dev/null || true
 "$SCRIPT_DIR/install_service.sh"
 

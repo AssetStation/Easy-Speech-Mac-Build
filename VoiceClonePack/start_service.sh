@@ -1,28 +1,48 @@
-#!/usr/bin/env bash
-# Easy Speech - Voice Clone Expansion Service Launcher for macOS
+#!/bin/bash
+DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$DIR"
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-cd "$SCRIPT_DIR"
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/Library/Frameworks/Python.framework/Versions/Current/bin:$PATH"
+export PYTORCH_ENABLE_MPS_FALLBACK=1
 
-VENV_PYTHON="$SCRIPT_DIR/.venv/bin/python3"
-SERVICE_SCRIPT="$SCRIPT_DIR/service.py"
+echo "========================================================"
+echo "  EASY SPEECH: VOICE CLONE EXPANSION SERVICE (macOS)"
+echo "========================================================"
 
-if [ ! -f "$SERVICE_SCRIPT" ]; then
-    SERVICE_SCRIPT="$SCRIPT_DIR/../backend/voice_clone_service.py"
+PYTHON_EXE=""
+if [ -f "$DIR/.venv/bin/python" ]; then
+    PYTHON_EXE="$DIR/.venv/bin/python"
+elif [ -f "$DIR/.venv/bin/python3" ]; then
+    PYTHON_EXE="$DIR/.venv/bin/python3"
+elif [ -f "$DIR/.python311/bin/python3" ]; then
+    PYTHON_EXE="$DIR/.python311/bin/python3"
+elif [ -f "$HOME/.easyspeech/python311/bin/python3" ]; then
+    PYTHON_EXE="$HOME/.easyspeech/python311/bin/python3"
+elif [ -f "$HOME/.easyspeech/venv/bin/python3" ]; then
+    PYTHON_EXE="$HOME/.easyspeech/venv/bin/python3"
+else
+    PYTHON_EXE="$(which python3 2>/dev/null || echo '')"
 fi
 
-if [ ! -x "$VENV_PYTHON" ]; then
-    echo "========================================================"
-    echo "  Easy Speech Voice Clone Expansion Service"
-    echo "========================================================"
-    echo "[!] Error: Virtual environment not found at $SCRIPT_DIR/.venv"
-    echo "    Please run the installation script first:"
-    echo "        ./install_service.sh"
-    echo "========================================================"
+if [ -z "$PYTHON_EXE" ]; then
+    echo "[!] ERROR: Python virtual environment not found."
+    echo "Please run './install_service.sh' first to set up the expansion pack."
+    echo ""
+    read -p "Press Enter to exit..."
     exit 1
 fi
 
-chmod +x "$VENV_PYTHON" 2>/dev/null || true
-
-echo "[*] Starting Easy Speech Voice Clone Service..."
-exec "$VENV_PYTHON" "$SERVICE_SCRIPT"
+echo "[*] Using Python: $PYTHON_EXE"
+echo "[*] Starting Voice Clone Service on http://127.0.0.1:8765 ..."
+echo "[*] Keep this window open while using Voice Cloning in Premiere Pro / After Effects."
+echo ""
+if [ -f "$DIR/service.pyc" ]; then
+    "$PYTHON_EXE" "$DIR/service.pyc"
+else
+    "$PYTHON_EXE" "$DIR/service.py"
+fi
+if [ $? -ne 0 ]; then
+    echo ""
+    echo "[!] Service stopped with an error."
+    read -p "Press Enter to exit..."
+fi

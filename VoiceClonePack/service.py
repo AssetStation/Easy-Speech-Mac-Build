@@ -1,5 +1,5 @@
 """
-Easy Speech - Voice Clone RTX Expansion Service
+Easy Speech - Voice Clone Expansion Service
 High-Fidelity Offline Voice Cloning Background Daemon (F5-TTS & Faster-Whisper)
 """
 
@@ -11,13 +11,18 @@ import threading
 import subprocess
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
+# Ensure PyTorch enables CPU fallback for unsupported MPS operators on Apple Silicon
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+
+# Add executable Scripts directory to PATH for local ffmpeg and tools
+_exe_dir = os.path.dirname(sys.executable)
+if _exe_dir not in os.environ.get("PATH", ""):
+    os.environ["PATH"] = _exe_dir + os.path.pathsep + os.environ.get("PATH", "")
+
 # Safe stream handling for windowless execution (pythonw.exe / detached daemons)
 if sys.stdout is None:
     try:
-        if sys.platform == "darwin":
-            log_dir = os.path.join(os.path.expanduser("~"), "Library", "Logs", "EasySpeech")
-        else:
-            log_dir = os.path.join(os.environ.get('LOCALAPPDATA', os.path.dirname(os.path.abspath(__file__))), 'EasySpeech', 'logs')
+        log_dir = os.path.join(os.environ.get('LOCALAPPDATA', os.path.dirname(os.path.abspath(__file__))), 'EasySpeech', 'logs')
         os.makedirs(log_dir, exist_ok=True)
         sys.stdout = open(os.path.join(log_dir, 'voice_clone_service.log'), 'a', encoding='utf-8', buffering=1)
     except Exception:
@@ -41,25 +46,79 @@ if hasattr(sys.stderr, 'reconfigure') and callable(getattr(sys.stderr, 'reconfig
 HOST = "127.0.0.1"
 PORT = 8765
 
-PACK_DIR = os.path.dirname(os.path.abspath(__file__))
-MODELS_DIR = os.path.join(PACK_DIR, "models")
+BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+EXT_ROOT = os.path.dirname(BACKEND_DIR)
+MODELS_DIR = os.path.join(EXT_ROOT, "VoiceClonePack", "models")
+if not os.path.exists(MODELS_DIR):
+    MODELS_DIR = os.path.join(EXT_ROOT, "models")
 if os.path.exists(MODELS_DIR):
     os.environ["HF_HOME"] = os.path.abspath(MODELS_DIR)
 
 # Global State
 START_TIME = time.time()
-LAST_REQUEST_TIME = time.time()
-MODEL_LOCK = threading.Lock()
+LAST_HEARTBEAT_TIME = time.time()
+LAST_SYNTHESIS_TIME = 0.0
+MODEL_LOCK = threading.RLock()
+PARENT_PID = None
+
+# Active Processing State (guards against premature timeouts during long script synthesis)
+ACTIVE_TASKS = 0
+ACTIVE_TASKS_LOCK = threading.Lock()
+
+def start_active_task():
+    global ACTIVE_TASKS, LAST_HEARTBEAT_TIME
+    with ACTIVE_TASKS_LOCK:
+        ACTIVE_TASKS += 1
+        LAST_HEARTBEAT_TIME = time.time()
+
+def finish_active_task():
+    global ACTIVE_TASKS, LAST_SYNTHESIS_TIME, LAST_HEARTBEAT_TIME
+    now = time.time()
+    with ACTIVE_TASKS_LOCK:
+        ACTIVE_TASKS = max(0, ACTIVE_TASKS - 1)
+        LAST_SYNTHESIS_TIME = now
+        LAST_HEARTBEAT_TIME = now
+
+def is_currently_processing():
+    with ACTIVE_TASKS_LOCK:
+        return ACTIVE_TASKS > 0
 
 _f5_instance = None
 _whisper_instance = None
 _ffmpeg_exe_path = None
 
+def is_process_alive(pid):
+    """Checks whether a given process ID is actively running on the host system."""
+    if not pid or pid <= 0:
+        return False
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            SYNCHRONIZE = 0x00100000
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            h_process = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, False, int(pid))
+            if not h_process:
+                return False
+            exit_code = ctypes.c_ulong()
+            success = kernel32.GetExitCodeProcess(h_process, ctypes.byref(exit_code))
+            kernel32.CloseHandle(h_process)
+            STILL_ACTIVE = 259
+            return bool(success) and (exit_code.value == STILL_ACTIVE)
+        except Exception:
+            return False
+    else:
+        try:
+            os.kill(int(pid), 0)
+            return True
+        except (OSError, ProcessLookupError):
+            return False
+
 def get_ffmpeg_path():
     global _ffmpeg_exe_path
     if _ffmpeg_exe_path and os.path.exists(_ffmpeg_exe_path):
         return _ffmpeg_exe_path
-
+    
     # 1. Try imageio_ffmpeg
     try:
         import imageio_ffmpeg
@@ -73,39 +132,23 @@ def get_ffmpeg_path():
     except Exception:
         pass
 
-    # 2. Check shutil.which (Standard Library, cross-platform)
+    # 2. Check system PATH
     try:
-        import shutil
-        w = shutil.which("ffmpeg")
-        if w and os.path.exists(w):
-            _ffmpeg_exe_path = w
-            return _ffmpeg_exe_path
+        which_cmd = ["where", "ffmpeg"] if sys.platform == "win32" else ["which", "ffmpeg"]
+        res = subprocess.run(which_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if res.returncode == 0:
+            lines = [l.strip() for l in res.stdout.strip().splitlines() if l.strip()]
+            if lines and os.path.exists(lines[0]):
+                _ffmpeg_exe_path = lines[0]
+                return _ffmpeg_exe_path
     except Exception:
         pass
-
-    # 3. macOS Homebrew and standard system binary paths
-    if sys.platform == "darwin":
-        for mac_path in ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]:
-            if os.path.exists(mac_path):
-                _ffmpeg_exe_path = mac_path
-                return _ffmpeg_exe_path
-
-    # 4. Windows where fallback
-    if sys.platform.startswith("win"):
-        try:
-            res = subprocess.run(["where", "ffmpeg"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            if res.returncode == 0:
-                lines = [l.strip() for l in res.stdout.strip().splitlines() if l.strip()]
-                if lines and os.path.exists(lines[0]):
-                    _ffmpeg_exe_path = lines[0]
-                    return _ffmpeg_exe_path
-        except Exception:
-            pass
 
     return "ffmpeg"
 
 def convert_audio_to_24k_mono_wav(source_path, target_path=None):
     """Converts any audio file (m4a, mp3, ogg, wav) to clean 24kHz mono PCM WAV."""
+    init_environment()
     if not os.path.exists(source_path):
         raise FileNotFoundError(f"Source audio file not found: {source_path}")
 
@@ -131,117 +174,222 @@ def convert_audio_to_24k_mono_wav(source_path, target_path=None):
 
     return target_path
 
-def get_best_device():
-    """Detects best available compute device: CUDA -> Apple Silicon MPS -> CPU."""
+_env_initialized = False
+_env_lock = threading.Lock()
+
+def init_environment():
+    """Initializes portable ffmpeg, pydub, and CUDA DLL paths in background or on first use."""
+    global _env_initialized, _ffmpeg_exe_path
+    with _env_lock:
+        if _env_initialized:
+            return
+        try:
+            import imageio_ffmpeg
+            _ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
+            if _ffmpeg_bin and os.path.exists(_ffmpeg_bin):
+                _ffmpeg_exe_path = _ffmpeg_bin
+                _ff_dir = os.path.dirname(_ffmpeg_bin)
+                if _ff_dir not in os.environ.get("PATH", ""):
+                    os.environ["PATH"] = _ff_dir + os.path.pathsep + os.environ.get("PATH", "")
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    import pydub
+                    pydub.AudioSegment.converter = _ffmpeg_bin
+        except Exception:
+            pass
+
+        try:
+            import torch
+            torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
+            if torch_lib not in os.environ.get("PATH", ""):
+                os.environ["PATH"] = torch_lib + os.path.pathsep + os.environ.get("PATH", "")
+            if hasattr(os, "add_dll_directory") and os.path.exists(torch_lib):
+                os.add_dll_directory(torch_lib)
+        except Exception:
+            pass
+
+        get_gpu_info()
+        _env_initialized = True
+
+_gpu_static_cache = None
+
+def get_gpu_info(allow_block=True):
+    global _gpu_static_cache
+    if _gpu_static_cache is not None:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                free_bytes, total_bytes = torch.cuda.mem_get_info()
+                _gpu_static_cache["vram_free_gb"] = round(free_bytes / (1024 ** 3), 2)
+                _gpu_static_cache["vram_allocated_gb"] = round(torch.cuda.memory_allocated() / (1024 ** 3), 2)
+        except Exception:
+            pass
+        return _gpu_static_cache
+
+    if not allow_block:
+        return {
+            "cuda_available": False,
+            "is_supported": False,
+            "device_name": "Initializing GPU Mode...",
+            "vram_total_gb": 0,
+            "vram_free_gb": 0,
+            "vram_allocated_gb": 0
+        }
+
     try:
         import torch
         if torch.cuda.is_available():
-            return "cuda"
-        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            return "mps"
-    except Exception:
-        pass
-    return "cpu"
-
-def empty_device_cache():
-    """Clears GPU cache across NVIDIA CUDA and Apple Silicon MPS."""
-    try:
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        elif hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
-            torch.mps.empty_cache()
-    except Exception:
-        pass
-
-_gpu_info_cache = None
-
-def get_gpu_info():
-    global _gpu_info_cache
-    if _gpu_info_cache is not None:
-        return _gpu_info_cache
-    try:
-        import torch
-        if torch.cuda.is_available():
-            free_bytes, total_bytes = torch.cuda.mem_get_info()
-            _gpu_info_cache = {
+            total_bytes = torch.cuda.get_device_properties(0).total_memory
+            total_gb = round(total_bytes / (1024 ** 3), 2)
+            try:
+                free_bytes, _ = torch.cuda.mem_get_info()
+                free_gb = round(free_bytes / (1024 ** 3), 2)
+            except Exception:
+                free_gb = total_gb
+            _gpu_static_cache = {
                 "cuda_available": True,
-                "mps_available": False,
+                "is_supported": total_gb >= 3.5,
                 "device_name": torch.cuda.get_device_name(0),
-                "vram_total_gb": round(total_bytes / (1024 ** 3), 2),
-                "vram_free_gb": round(free_bytes / (1024 ** 3), 2),
+                "vram_total_gb": total_gb,
+                "vram_free_gb": free_gb,
                 "vram_allocated_gb": round(torch.cuda.memory_allocated() / (1024 ** 3), 2)
             }
-            return _gpu_info_cache
+            return _gpu_static_cache
         elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            device_name = "Apple Silicon (Metal MPS GPU)"
-            try:
-                if sys.platform == "darwin":
-                    res = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                    if res.returncode == 0 and res.stdout.strip():
-                        device_name = res.stdout.strip() + " (Metal GPU)"
-            except Exception:
-                pass
-            _gpu_info_cache = {
+            import platform
+            dev_name = platform.processor() or "Apple Silicon"
+            _gpu_static_cache = {
                 "cuda_available": False,
                 "mps_available": True,
-                "device_name": device_name,
+                "is_supported": True,
+                "device_name": f"{dev_name} (Metal GPU)",
                 "vram_total_gb": "Unified",
-                "vram_free_gb": "Unified",
+                "vram_free_gb": "Dynamic",
                 "vram_allocated_gb": 0
             }
-            return _gpu_info_cache
+            return _gpu_static_cache
     except Exception:
         pass
-    _gpu_info_cache = {
+
+    return {
         "cuda_available": False,
-        "mps_available": False,
-        "device_name": "CPU Mode",
+        "is_supported": False,
+        "device_name": "Initializing GPU Mode...",
         "vram_total_gb": 0,
         "vram_free_gb": 0,
         "vram_allocated_gb": 0
     }
-    return _gpu_info_cache
+
+def find_local_f5_paths():
+    """Locate bundled F5-TTS checkpoint and Vocos vocoder snapshots locally."""
+    ckpt_path = None
+    vocoder_path = None
+
+    # Search for F5-TTS checkpoint
+    f5_hub = os.path.join(MODELS_DIR, "hub", "models--SWivid--F5-TTS", "snapshots")
+    if os.path.exists(f5_hub):
+        for snap in os.listdir(f5_hub):
+            cand = os.path.join(f5_hub, snap, "F5TTS_v1_Base", "model_1250000.safetensors")
+            if os.path.exists(cand):
+                ckpt_path = cand
+                break
+    if not ckpt_path:
+        direct_cand = os.path.join(MODELS_DIR, "F5TTS_v1_Base", "model_1250000.safetensors")
+        if os.path.exists(direct_cand):
+            ckpt_path = direct_cand
+
+    # Search for Vocos vocoder
+    vocos_hub = os.path.join(MODELS_DIR, "hub", "models--charactr--vocos-mel-24khz", "snapshots")
+    if os.path.exists(vocos_hub):
+        for snap in os.listdir(vocos_hub):
+            cand = os.path.join(vocos_hub, snap)
+            if os.path.exists(os.path.join(cand, "config.yaml")) and os.path.exists(os.path.join(cand, "pytorch_model.bin")):
+                vocoder_path = cand
+                break
+    if not vocoder_path:
+        direct_voc = os.path.join(MODELS_DIR, "vocos-mel-24khz")
+        if os.path.exists(os.path.join(direct_voc, "config.yaml")):
+            vocoder_path = direct_voc
+
+    return ckpt_path, vocoder_path
 
 def get_f5_model():
     global _f5_instance
+    init_environment()
     with MODEL_LOCK:
         if _f5_instance is None:
             import torch
             from f5_tts.api import F5TTS
-            device = get_best_device()
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                device = "mps"
+            else:
+                device = "cpu"
             print(f"[*] Initializing F5-TTS model on {device.upper()}...")
+            
             if os.path.exists(MODELS_DIR):
                 os.environ["HF_HOME"] = os.path.abspath(MODELS_DIR)
+
+            ckpt_path, vocoder_path = find_local_f5_paths()
+            if ckpt_path and vocoder_path:
+                # Enforce strict offline execution once bundled snapshots are verified
                 os.environ["HF_HUB_OFFLINE"] = "1"
-            try:
-                # Fast offline load from local models folder
-                _f5_instance = F5TTS(device=device)
-            except Exception as e:
-                print(f"[!] Local F5-TTS load on {device} warning: {e}. Retrying with offline mode unset...")
-                os.environ.pop("HF_HUB_OFFLINE", None)
+                os.environ["TRANSFORMERS_OFFLINE"] = "1"
+                print(f"[+] Using local offline F5 checkpoint: {ckpt_path}")
+                print(f"[+] Using local offline Vocos vocoder: {vocoder_path}")
+                try:
+                    _f5_instance = F5TTS(ckpt_file=ckpt_path, vocoder_local_path=vocoder_path, device=device)
+                except Exception as init_err:
+                    if device == "mps":
+                        print(f"[!] MPS initialization error ({init_err}). Falling back to CPU...")
+                        device = "cpu"
+                        _f5_instance = F5TTS(ckpt_file=ckpt_path, vocoder_local_path=vocoder_path, device="cpu")
+                    else:
+                        raise init_err
+            else:
+                print("[!] Local bundled snapshot paths not found directly. Loading via HF_HOME...")
                 try:
                     _f5_instance = F5TTS(device=device)
-                except Exception as e2:
+                except Exception as init_err:
                     if device == "mps":
-                        print(f"[!] MPS initialization note: {e2}. Falling back to CPU...")
-                        _f5_instance = F5TTS(device="cpu")
+                        print(f"[!] MPS initialization error ({init_err}). Falling back to CPU...")
+                        device = "cpu"
+                        try:
+                            _f5_instance = F5TTS(device="cpu")
+                        except Exception as cpu_err:
+                            err_msg = str(cpu_err).lower()
+                            if any(k in err_msg for k in ["connection", "offline", "resolution", "getaddrinfo", "timeout", "timed out", "unreachable"]):
+                                raise RuntimeError("Neural models not found locally and internet connection is unavailable. Please connect to the internet to download AI model weights.") from cpu_err
+                            raise cpu_err
                     else:
-                        raise e2
+                        err_msg = str(init_err).lower()
+                        if any(k in err_msg for k in ["connection", "offline", "resolution", "getaddrinfo", "timeout", "timed out", "unreachable"]):
+                            raise RuntimeError("Neural models not found locally and internet connection is unavailable. Please connect to the internet to download AI model weights.") from init_err
+                        raise init_err
+
             print("[+] F5-TTS model initialized and warmed up!")
         return _f5_instance
 
 def get_whisper_model():
     global _whisper_instance
+    init_environment()
     with MODEL_LOCK:
         if _whisper_instance is None:
             import torch
+            # Ensure CTranslate2 can locate cublas64_12.dll and cudnn
+            torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
+            if torch_lib not in os.environ.get("PATH", ""):
+                os.environ["PATH"] = torch_lib + os.path.pathsep + os.environ.get("PATH", "")
+            if hasattr(os, "add_dll_directory") and os.path.exists(torch_lib):
+                os.add_dll_directory(torch_lib)
+
             from faster_whisper import WhisperModel
             if torch.cuda.is_available():
                 device = "cuda"
                 compute_type = "float16"
             else:
-                # CPU mode on Windows and macOS (ARM NEON optimized)
                 device = "cpu"
                 compute_type = "int8"
             
@@ -258,17 +406,39 @@ def get_whisper_model():
 
             print(f"[*] Initializing WhisperModel ('{whisper_model_path}') on {device.upper()} ({compute_type})...")
             download_root = os.path.join(MODELS_DIR, "hub") if os.path.exists(MODELS_DIR) else None
-            _whisper_instance = WhisperModel(whisper_model_path, device=device, compute_type=compute_type, download_root=download_root)
+            try:
+                _whisper_instance = WhisperModel(whisper_model_path, device=device, compute_type=compute_type, download_root=download_root)
+            except Exception as wm_err:
+                err_msg = str(wm_err).lower()
+                if any(k in err_msg for k in ["connection", "offline", "resolution", "getaddrinfo", "timeout", "timed out", "unreachable"]):
+                    raise RuntimeError("Whisper speech model not found locally and internet connection is unavailable. Please connect to the internet to download recognition weights.") from wm_err
+                raise wm_err
             print("[+] Whisper model ready!")
         return _whisper_instance
 
 def unload_models():
     global _f5_instance, _whisper_instance
     with MODEL_LOCK:
+        has_loaded = (_f5_instance is not None or _whisper_instance is not None)
         _f5_instance = None
         _whisper_instance = None
-        empty_device_cache()
-        print("[*] VRAM emptied and models unloaded.")
+        try:
+            import gc
+            gc.collect()
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                if hasattr(torch.cuda, "ipc_collect"):
+                    torch.cuda.ipc_collect()
+            elif hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+                try:
+                    torch.mps.empty_cache()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        if has_loaded:
+            print("[*] VRAM emptied and models unloaded.")
 
 class VoiceCloneRequestHandler(BaseHTTPRequestHandler):
     def _send_cors_headers(self):
@@ -290,19 +460,21 @@ class VoiceCloneRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        global LAST_REQUEST_TIME
-        LAST_REQUEST_TIME = time.time()
+        global LAST_HEARTBEAT_TIME
+        LAST_HEARTBEAT_TIME = time.time()
 
-        if self.path in ["/", "/health", "/api/status"]:
-            gpu = get_gpu_info()
+        if self.path in ["/", "/health", "/api/status", "/api/ping", "/ping"]:
+            gpu = get_gpu_info(allow_block=False)
             uptime = round(time.time() - START_TIME, 1)
-            idle = round(time.time() - LAST_REQUEST_TIME, 1)
+            idle = round(time.time() - LAST_HEARTBEAT_TIME, 1)
+            since_synth = round(time.time() - LAST_SYNTHESIS_TIME, 1) if LAST_SYNTHESIS_TIME > 0 else None
             self._send_json_response(200, {
                 "status": "online",
                 "service": "Easy Speech Voice Clone Expansion Pack",
                 "version": "1.0.0",
                 "uptime_seconds": uptime,
                 "idle_seconds": idle,
+                "seconds_since_synthesis": since_synth,
                 "model_loaded": _f5_instance is not None,
                 "gpu": gpu
             })
@@ -310,8 +482,8 @@ class VoiceCloneRequestHandler(BaseHTTPRequestHandler):
             self._send_json_response(404, {"error": "Not Found"})
 
     def do_POST(self):
-        global LAST_REQUEST_TIME
-        LAST_REQUEST_TIME = time.time()
+        global LAST_HEARTBEAT_TIME, LAST_SYNTHESIS_TIME, _whisper_instance
+        LAST_HEARTBEAT_TIME = time.time()
 
         content_length = int(self.headers.get("Content-Length", 0))
         post_data = self.rfile.read(content_length)
@@ -319,12 +491,17 @@ class VoiceCloneRequestHandler(BaseHTTPRequestHandler):
         data = {}
         if post_data:
             try:
-                data = json.loads(post_data.decode("utf-8"))
+                data = json.loads(post_data.decode("utf-8-sig"))
             except Exception as e:
                 self._send_json_response(400, {"success": False, "error": f"Invalid JSON body: {str(e)}"})
                 return
 
         path = self.path.rstrip("/")
+
+        # 0. Heartbeat / Ping Endpoint
+        if path in ["/api/ping", "/ping"]:
+            self._send_json_response(200, {"success": True, "pong": True, "time": time.time()})
+            return
 
         # 1. Audio Conversion Endpoint
         if path == "/api/convert":
@@ -342,13 +519,14 @@ class VoiceCloneRequestHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_json_response(500, {"success": False, "error": str(e)})
 
-        # 2. Reference Audio Transcription Endpoint
+        # 2. Reference Audio Transcription Endpoint (Protected by MODEL_LOCK)
         elif path == "/api/transcribe":
             audio_path = data.get("audio_path")
             if not audio_path or not os.path.exists(audio_path):
                 self._send_json_response(400, {"success": False, "error": f"Audio file not found: {audio_path}"})
                 return
 
+            start_active_task()
             t0 = time.time()
             try:
                 # Pre-convert to WAV if non-WAV container
@@ -357,15 +535,57 @@ class VoiceCloneRequestHandler(BaseHTTPRequestHandler):
                 if ext != ".wav":
                     clean_audio = convert_audio_to_24k_mono_wav(audio_path)
 
-                wm = get_whisper_model()
-                segments, info = wm.transcribe(clean_audio, language="en")
-                text = " ".join([seg.text.strip() for seg in segments if seg.text.strip()]).strip()
+                with MODEL_LOCK:
+                    wm = get_whisper_model()
+                    segments, info = wm.transcribe(clean_audio, language="en")
+                    seg_list = [s for s in segments if s.text.strip()]
+                    total_dur = getattr(info, "duration", 0)
+
+                    # Guard against F5-TTS 12s ceiling: if reference audio exceeds 9.5s,
+                    # F5-TTS truncates audio but leaves ref_text dangling, causing word bleed.
+                    # Automatically select the best complete sentence segment within 3.5s - 9.5s.
+                    if total_dur > 9.5 and seg_list:
+                        selected_segs = []
+                        for s in seg_list:
+                            if s.end <= 9.5:
+                                selected_segs.append(s)
+                            elif not selected_segs and s.start < 9.5:
+                                selected_segs.append(s)
+                                break
+                            else:
+                                break
+                        if selected_segs and selected_segs[-1].end < total_dur:
+                            cutoff_sec = min(selected_segs[-1].end + 0.15, total_dur)
+                            import soundfile as sf
+                            a_data, a_sr = sf.read(clean_audio)
+                            trimmed_data = a_data[:int(cutoff_sec * a_sr)]
+                            base_no_ext, _ = os.path.splitext(clean_audio)
+                            opt_path = base_no_ext + "_optref.wav"
+                            sf.write(opt_path, trimmed_data, a_sr)
+                            clean_audio = opt_path
+                            text = " ".join([s.text.strip() for s in selected_segs]).strip()
+                            total_dur = cutoff_sec
+                        else:
+                            text = " ".join([seg.text.strip() for seg in seg_list]).strip()
+                    else:
+                        text = " ".join([seg.text.strip() for seg in seg_list]).strip()
+
+                    # Immediately release Whisper from VRAM to preserve memory for synthesis
+                    _whisper_instance = None
+                    try:
+                        import gc
+                        gc.collect()
+                        import torch
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    except Exception:
+                        pass
                 elapsed = time.time() - t0
 
                 self._send_json_response(200, {
                     "success": True,
                     "text": text,
-                    "duration": round(info.duration, 2) if hasattr(info, "duration") else 0,
+                    "duration": round(total_dur, 2),
                     "transcribe_time": round(elapsed, 2),
                     "clean_audio_path": clean_audio.replace("\\", "/")
                 })
@@ -376,8 +596,10 @@ class VoiceCloneRequestHandler(BaseHTTPRequestHandler):
                     "error": str(e),
                     "traceback": traceback.format_exc()
                 })
+            finally:
+                finish_active_task()
 
-        # 3. High-Speed Synthesis Endpoint
+        # 3. High-Speed Synthesis Endpoint (Protected by MODEL_LOCK with OOM Recovery)
         elif path == "/api/generate":
             text = (data.get("text") or "").strip()
             ref_audio = data.get("ref_audio")
@@ -394,10 +616,12 @@ class VoiceCloneRequestHandler(BaseHTTPRequestHandler):
                 self._send_json_response(400, {"success": False, "error": f"Reference audio not found: {ref_audio}"})
                 return
 
+            start_active_task()
             t0 = time.time()
             try:
                 import torch
                 import soundfile as sf
+                import re
 
                 # Ensure reference audio is 24kHz mono WAV
                 ext = os.path.splitext(ref_audio)[1].lower()
@@ -405,11 +629,49 @@ class VoiceCloneRequestHandler(BaseHTTPRequestHandler):
                 if ext != ".wav":
                     clean_ref_audio = convert_audio_to_24k_mono_wav(ref_audio)
 
+                # Duration guard: F5-TTS silently chops reference audio > 12s, causing leftover
+                # reference text words to bleed into synthesis. If ref audio exceeds 10s, use
+                # pre-trimmed _optref.wav or extract the first complete sentence within <= 9.0s.
+                try:
+                    ref_info = sf.info(clean_ref_audio)
+                    if ref_info.duration > 10.0:
+                        base_no_ext, _ = os.path.splitext(clean_ref_audio)
+                        opt_path = base_no_ext + "_optref.wav"
+                        if os.path.exists(opt_path):
+                            clean_ref_audio = opt_path
+                        else:
+                            sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', ref_text) if s.strip()]
+                            if len(sentences) > 1:
+                                with MODEL_LOCK:
+                                    wm = get_whisper_model()
+                                    segs, _ = wm.transcribe(clean_ref_audio, language="en")
+                                    s_list = [s for s in segs if s.text.strip()]
+                                    _whisper_instance = None
+                                if s_list:
+                                    cutoff = min(s_list[0].end + 0.15, 9.0)
+                                    a_data, a_sr = sf.read(clean_ref_audio)
+                                    trimmed_data = a_data[:int(cutoff * a_sr)]
+                                    sf.write(opt_path, trimmed_data, a_sr)
+                                    clean_ref_audio = opt_path
+                                    ref_text = s_list[0].text.strip()
+                except Exception as dur_guard_err:
+                    print(f"[!] Reference duration guard note: {dur_guard_err}")
+
                 # Auto-transcribe if reference text was not provided
                 if not ref_text:
-                    wm = get_whisper_model()
-                    segs, _ = wm.transcribe(clean_ref_audio)
-                    ref_text = " ".join([s.text.strip() for s in segs]).strip()
+                    with MODEL_LOCK:
+                        wm = get_whisper_model()
+                        segs, _ = wm.transcribe(clean_ref_audio)
+                        ref_text = " ".join([s.text.strip() for s in segs]).strip()
+                        # Release whisper instance immediately
+                        _whisper_instance = None
+                        try:
+                            import gc
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                        except Exception:
+                            pass
 
                 # Generate output path if not specified
                 if not output_path:
@@ -419,17 +681,36 @@ class VoiceCloneRequestHandler(BaseHTTPRequestHandler):
 
                 os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
-                f5 = get_f5_model()
-
-                with torch.inference_mode():
-                    samples, sample_rate, _ = f5.infer(
-                        ref_file=clean_ref_audio,
-                        ref_text=ref_text,
-                        gen_text=text,
-                        speed=speed,
-                        nfe_step=nfe_step,
-                        cfg_strength=cfg_strength
-                    )
+                with MODEL_LOCK:
+                    f5 = get_f5_model()
+                    try:
+                        with torch.inference_mode():
+                            samples, sample_rate, _ = f5.infer(
+                                ref_file=clean_ref_audio,
+                                ref_text=ref_text,
+                                gen_text=text,
+                                speed=speed,
+                                nfe_step=nfe_step,
+                                cfg_strength=cfg_strength
+                            )
+                    except Exception as infer_err:
+                        err_str = str(infer_err).lower()
+                        is_oom = "out of memory" in err_str or "cuda error: out of memory" in err_str or "mps backend out of memory" in err_str
+                        if is_oom or (hasattr(torch.cuda, "OutOfMemoryError") and isinstance(infer_err, torch.cuda.OutOfMemoryError)):
+                            try:
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+                                elif hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+                                    torch.mps.empty_cache()
+                            except Exception:
+                                pass
+                            self._send_json_response(422, {
+                                "success": False,
+                                "is_oom": True,
+                                "error": "Insufficient free GPU VRAM. Pause timeline playback or rendering in Premiere Pro / After Effects and try again."
+                            })
+                            return
+                        raise infer_err
 
                 if samples is None or len(samples) == 0:
                     raise RuntimeError("Voice cloning returned empty audio samples.")
@@ -438,8 +719,14 @@ class VoiceCloneRequestHandler(BaseHTTPRequestHandler):
                 duration = float(len(samples)) / float(sample_rate)
                 elapsed = time.time() - t0
 
-                # Release scratch tensors to maintain VRAM head-room for Premiere Pro / After Effects
-                empty_device_cache()
+                # Release scratch tensors to maintain VRAM head-room for Premiere Pro
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                elif hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+                    try:
+                        torch.mps.empty_cache()
+                    except Exception:
+                        pass
 
                 self._send_json_response(200, {
                     "success": True,
@@ -458,42 +745,102 @@ class VoiceCloneRequestHandler(BaseHTTPRequestHandler):
                     "error": str(e),
                     "traceback": traceback.format_exc()
                 })
+            finally:
+                finish_active_task()
 
         # 4. Unload / VRAM Cleanup Endpoint
         elif path == "/api/unload":
             unload_models()
             self._send_json_response(200, {"success": True, "message": "Models unloaded and VRAM cleared."})
 
+        # 5. Clean Shutdown Endpoint
+        elif path == "/api/shutdown":
+            self._send_json_response(200, {"success": True, "message": "Voice Clone Daemon shutting down."})
+            def _delayed_exit():
+                time.sleep(0.3)
+                unload_models()
+                os._exit(0)
+            threading.Thread(target=_delayed_exit, daemon=True).start()
+
         else:
             self._send_json_response(404, {"error": f"Unknown endpoint: {path}"})
 
-def idle_vram_cleanup_worker():
-    """Background monitor that clears GPU cache if inactive for 10 minutes."""
+def parent_watchdog_worker():
+    """Monitors parent CEP process; if parent closes, crashes or is killed, exit immediately."""
+    global PARENT_PID
+    if not PARENT_PID:
+        return
+    consecutive_dead_count = 0
     while True:
-        time.sleep(30)
-        idle = time.time() - LAST_REQUEST_TIME
-        if idle > 600 and _f5_instance is not None:
-            empty_device_cache()
+        time.sleep(2)
+        if not is_process_alive(PARENT_PID):
+            consecutive_dead_count += 1
+            if consecutive_dead_count >= 3:  # 6s verified death (prevents premature exit during 100% CPU spikes)
+                print(f"[*] Parent process {PARENT_PID} terminated. Shutting down Voice Clone daemon to release VRAM...")
+                unload_models()
+                os._exit(0)
+        else:
+            consecutive_dead_count = 0
+
+def idle_vram_cleanup_worker():
+    """
+    1. VRAM Auto-Release: Unloads F5-TTS / Whisper after 90s of post-synthesis idle.
+       Guaranteed NEVER to unload or close while a long script is actively synthesizing!
+    2. Orphan Process Watchdog: If no parent PID is tracked and heartbeat is lost for 300s,
+       cleanly shuts down. If parent PID is tracked, parent_watchdog_worker handles lifecycle.
+    """
+    while True:
+        time.sleep(5)
+        now = time.time()
+
+        # NEVER unload or timeout while active synthesis or transcription is processing!
+        if is_currently_processing():
+            continue
+
+        # 1. Post-Synthesis VRAM Auto-Release (90 seconds idle after work completely finishes)
+        if _f5_instance is not None or _whisper_instance is not None:
+            if LAST_SYNTHESIS_TIME > 0 and (now - LAST_SYNTHESIS_TIME) > 90:
+                print("[*] Post-synthesis idle timeout (90s) reached. Releasing VRAM for Adobe host...")
+                unload_models()
+
+        # 2. Heartbeat Orphan Watchdog (only applies if daemon was run without a parent PID)
+        if not PARENT_PID:
+            if (now - LAST_HEARTBEAT_TIME) > 300:
+                print("[*] Heartbeat lost (300s inactivity without parent PID). Shutting down Voice Clone daemon...")
+                unload_models()
+                os._exit(0)
 
 def main():
+    global PARENT_PID
+    for i, arg in enumerate(sys.argv):
+        if arg == "--parent-pid" and i + 1 < len(sys.argv):
+            try:
+                PARENT_PID = int(sys.argv[i + 1])
+            except ValueError:
+                pass
+
     print("=" * 65)
     print("      Easy Speech - Voice Clone Expansion Service")
     print("=" * 65)
-    gpu = get_gpu_info()
-    print(f"[*] Target Device:    {gpu['device_name']}")
-    if gpu['cuda_available']:
-        print(f"[*] Free VRAM:        {gpu['vram_free_gb']} GB / {gpu['vram_total_gb']} GB")
-    elif gpu.get('mps_available'):
-        print(f"[*] Metal Hardware:   Apple Silicon Unified Memory")
-    else:
-        print("[!] Note: CUDA/MPS not detected. Voice cloning running on CPU.")
     print(f"[*] Listening on:     http://{HOST}:{PORT}")
     print(f"[*] Health endpoint:  http://{HOST}:{PORT}/health")
+    if PARENT_PID:
+        print(f"[*] Guarding Parent:  PID {PARENT_PID}")
     print("=" * 65)
 
-    threading.Thread(target=idle_vram_cleanup_worker, daemon=True).start()
+    try:
+        server = ThreadingHTTPServer((HOST, PORT), VoiceCloneRequestHandler)
+    except OSError as e:
+        if getattr(e, 'errno', None) in (98, 10048) or "address already in use" in str(e).lower():
+            print(f"[*] Voice Clone Service is ALREADY running on http://{HOST}:{PORT}")
+            sys.exit(0)
+        raise
 
-    server = ThreadingHTTPServer((HOST, PORT), VoiceCloneRequestHandler)
+    threading.Thread(target=init_environment, daemon=True).start()
+    threading.Thread(target=idle_vram_cleanup_worker, daemon=True).start()
+    if PARENT_PID:
+        threading.Thread(target=parent_watchdog_worker, daemon=True).start()
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:

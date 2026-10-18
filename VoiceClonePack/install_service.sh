@@ -1,143 +1,337 @@
-#!/usr/bin/env bash
-# Easy Speech - Voice Clone Expansion Pack Installer for macOS
-# Compatible with Apple Silicon (M1/M2/M3/M4) and Intel Macs
+#!/bin/bash
+DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$DIR"
 
-set -e
+# Ensure Homebrew and python.org standard install paths are available in GUI shell
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/Library/Frameworks/Python.framework/Versions/Current/bin:$PATH"
+export PYTORCH_ENABLE_MPS_FALLBACK=1
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-cd "$SCRIPT_DIR"
-
-echo "========================================================"
-echo "  EASY SPEECH: VOICE CLONE EXPANSION INSTALLER (macOS)"
-echo "========================================================"
-echo ""
-
-# 1. Verify macOS
-OS_NAME="$(uname -s)"
-if [ "$OS_NAME" != "Darwin" ]; then
-    echo "[!] Error: This script is intended for macOS only (detected: $OS_NAME)."
-    exit 1
+NO_PAUSE=0
+if [ "$1" = "--no-pause" ]; then
+    NO_PAUSE=1
 fi
 
-ARCH="$(uname -m)"
-echo "[*] System Architecture: $ARCH"
-if [ "$ARCH" = "arm64" ]; then
-    echo "[✓] Apple Silicon (M1/M2/M3/M4) detected! Metal (MPS) GPU acceleration supported."
+echo "======================================================================"
+echo "      EASY SPEECH: VOICE CLONE PACK INSTALLER (macOS)"
+echo "   Local AI Voice Cloning Setup Engine for Premiere Pro & AE"
+echo "======================================================================"
+echo ""
+
+# Clear any stale completion marker
+rm -f "$DIR/.installed_success" 2>/dev/null
+
+# Fast Check: If existing environment is already 100% healthy, avoid re-downloading!
+if [ -f "$DIR/.venv/bin/python" ]; then
+    echo "[PROGRESS:15] Checking existing AI environment integrity..."
+    echo "[*] Checking health of existing Voice Clone installation..."
+    if "$DIR/.venv/bin/python" -c "import torch, f5_tts, faster_whisper" >/dev/null 2>&1; then
+        echo "[HEALTH_CHECK:PASSED]"
+        echo "[PROGRESS:100] All AI packages are healthy and verified!"
+        echo "[✓] Fast Health Check Passed: All AI packages are already installed and 100% functional!"
+        echo "[✓] Zero re-downloading required. Your Voice Clone Pack is ready."
+        echo "1.0.0" > "$DIR/.installed_success"
+        echo ""
+        echo "======================================================================"
+        echo "              HEALTH CHECK VERIFIED: ALL PACKAGES HEALTHY"
+        echo "======================================================================"
+        echo "PyTorch, F5-TTS, and Whisper engines are 100% intact and verified."
+        echo "Zero re-downloading required. Your Voice Clone Pack is ready."
+        echo "======================================================================"
+        echo ""
+        if [ "$NO_PAUSE" != "1" ]; then
+            read -p "Press Enter to exit..."
+        fi
+        exit 0
+    else
+        echo "[PROGRESS:20] Missing or damaged packages detected. Proceeding with automated repair..."
+        echo "[!] Missing or damaged packages detected. Proceeding with automated repair..."
+        echo ""
+    fi
+fi
+
+# -----------------------------------------------------------------------
+# Step 0: Pre-Flight Network Connectivity Check
+# -----------------------------------------------------------------------
+echo "[PROGRESS:5] Checking network connectivity..."
+echo "[*] Step 0/4: Checking internet connection..."
+ONLINE=0
+for test_url in "https://pypi.org" "https://download.pytorch.org" "https://www.google.com"; do
+    if curl -s --head --connect-timeout 3 "$test_url" >/dev/null 2>&1; then
+        ONLINE=1
+        break
+    fi
+done
+
+if [ "$ONLINE" -ne 1 ]; then
+    echo "[!] ERROR: No active internet connection detected."
+    echo "    Voice Clone Pack requires an active internet connection to download dependencies."
+    echo "    Please check your network connection and retry setup."
+    if [ "$NO_PAUSE" != "1" ]; then
+        read -p "Press Enter to exit..."
+    fi
+    exit 2
+fi
+echo "[✓] Internet connection is active."
+echo ""
+
+# -----------------------------------------------------------------------
+# Step 0b: Pre-Flight Free Disk Space Check (Requires >= 8 GB)
+# -----------------------------------------------------------------------
+echo "[PROGRESS:7] Checking free disk space..."
+echo "[*] Checking available storage on drive..."
+FREE_KB=$(df -k "$DIR" | awk 'NR==2 {print $4}')
+if [ -n "$FREE_KB" ] && [ "$FREE_KB" -lt 8388608 ]; then
+    echo "[!] ERROR: Insufficient disk space."
+    echo "    Voice Clone Pack requires at least 8 GB of free disk space for AI neural engines."
+    echo "    Available: $((FREE_KB / 1024 / 1024)) GB"
+    if [ "$NO_PAUSE" != "1" ]; then
+        read -p "Press Enter to exit..."
+    fi
+    exit 3
+fi
+echo "[✓] Sufficient disk space available (>= 8 GB)."
+echo ""
+
+# -----------------------------------------------------------------------
+# Step 1: Check Mac Hardware
+# -----------------------------------------------------------------------
+echo "[PROGRESS:10] Checking Mac hardware..."
+echo "[*] Step 1/4: Checking hardware acceleration..."
+CPU_BRAND="$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo '')"
+if echo "$CPU_BRAND" | grep -qi "Apple"; then
+    echo "[✓] Detected Apple Silicon: $CPU_BRAND"
+    echo "[✓] Metal Performance Shaders (MPS) hardware acceleration available."
 else
-    echo "[*] Intel Mac detected. Diffusion will run with multi-threaded CPU acceleration."
+    echo "[i] Detected Intel Mac: $CPU_BRAND"
+    echo "[i] Neural models will run with multi-threaded CPU acceleration."
 fi
 echo ""
 
-# 2. Locate suitable Python 3
-PYTHON_BIN=""
-for cand in "/opt/homebrew/bin/python3.11" "/opt/homebrew/bin/python3.10" "/opt/homebrew/bin/python3" \
-            "/usr/local/bin/python3.11" "/usr/local/bin/python3.10" "/usr/local/bin/python3" \
-            "$(command -v python3.11 2>/dev/null || true)" \
-            "$(command -v python3.10 2>/dev/null || true)" \
-            "$(command -v python3 2>/dev/null || true)"; do
+# -----------------------------------------------------------------------
+# Step 2: Check or Auto-Install Standalone Python
+# -----------------------------------------------------------------------
+echo "[PROGRESS:25] Checking Python environment..."
+echo "[*] Step 2/4: Checking Python 3.10 / 3.11 / 3.12 installation..."
+PYTHON_EXE=""
+
+for cand in "$DIR/.python311/bin/python3" "$HOME/.easyspeech/python311/bin/python3" "/opt/homebrew/bin/python3.12" "/opt/homebrew/bin/python3.11" "/opt/homebrew/bin/python3.10" "/opt/homebrew/bin/python3" "/usr/local/bin/python3.12" "/usr/local/bin/python3.11" "/usr/local/bin/python3.10" "/usr/local/bin/python3" "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3" "/Library/Frameworks/Python.framework/Versions/3.11/bin/python3" "/Library/Frameworks/Python.framework/Versions/3.10/bin/python3" "$(which python3 2>/dev/null)"; do
     if [ -n "$cand" ] && [ -x "$cand" ]; then
-        VER="$($cand -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || true)"
-        MAJOR="$(echo "$VER" | cut -d. -f1)"
-        MINOR="$(echo "$VER" | cut -d. -f2)"
-        if [ "$MAJOR" = "3" ] && [ "$MINOR" -ge 9 ] && [ "$MINOR" -le 12 ]; then
-            PYTHON_BIN="$cand"
+        if "$cand" -c "import sys; sys.exit(0 if (3, 10) <= sys.version_info < (3, 13) else 1)" >/dev/null 2>&1; then
+            PYTHON_EXE="$cand"
             break
         fi
     fi
 done
 
-if [ -z "$PYTHON_BIN" ]; then
-    echo "[*] Python 3 not found on system."
-    echo "[*] Automatically downloading portable standalone Python 3.11 for macOS ($ARCH)..."
-    if [ "$ARCH" = "arm64" ]; then
-        PY_URL="https://github.com/astral-sh/python-build-standalone/releases/download/20240814/cpython-3.11.9+20240814-aarch64-apple-darwin-install_only.tar.gz"
-    else
-        PY_URL="https://github.com/astral-sh/python-build-standalone/releases/download/20240814/cpython-3.11.9+20240814-x86_64-apple-darwin-install_only.tar.gz"
+if [ -z "$PYTHON_EXE" ]; then
+    echo "[!] No existing Python 3.10+ detected on your Mac."
+    if which brew >/dev/null 2>&1; then
+        echo "[PROGRESS:35] Installing Python 3.11 via Homebrew..."
+        brew install python@3.11 2>/dev/null
+        for b_cand in "/opt/homebrew/bin/python3.11" "/usr/local/bin/python3.11" "$(which python3 2>/dev/null)"; do
+            if [ -n "$b_cand" ] && [ -x "$b_cand" ]; then
+                if "$b_cand" -c "import sys; sys.exit(0 if (3, 10) <= sys.version_info < (3, 13) else 1)" >/dev/null 2>&1; then
+                    PYTHON_EXE="$b_cand"
+                    break
+                fi
+            fi
+        done
     fi
-    curl -L -o "$SCRIPT_DIR/python-mac.tar.gz" "$PY_URL"
-    mkdir -p "$SCRIPT_DIR/_py_tmp"
-    tar -xzf "$SCRIPT_DIR/python-mac.tar.gz" -C "$SCRIPT_DIR/_py_tmp"
-    rm "$SCRIPT_DIR/python-mac.tar.gz"
-    rm -rf "$SCRIPT_DIR/.venv"
-    mv "$SCRIPT_DIR/_py_tmp/python" "$SCRIPT_DIR/.venv"
-    rm -rf "$SCRIPT_DIR/_py_tmp"
-    chmod -R +x "$SCRIPT_DIR/.venv/bin"
-    PYTHON_BIN="$SCRIPT_DIR/.venv/bin/python3"
-    echo "[✓] Portable Python 3.11 configured in $SCRIPT_DIR/.venv"
-else
-    echo "[✓] Using System Python: $PYTHON_BIN ($($PYTHON_BIN --version))"
-fi
-echo ""
-
-# 3. Check for FFmpeg (optional but recommended)
-if command -v ffmpeg >/dev/null 2>&1; then
-    echo "[✓] System FFmpeg found at $(command -v ffmpeg)"
-else
-    echo "[i] Tip: System FFmpeg not found in PATH."
-    echo "    imageio-ffmpeg will be used automatically, or you can install FFmpeg via:"
-    echo "        brew install ffmpeg"
-fi
-echo ""
-
-# 4. Create dedicated virtual environment
-VENV_DIR="$SCRIPT_DIR/.venv"
-if [ -d "$VENV_DIR" ]; then
-    echo "[*] Existing virtual environment found at $VENV_DIR"
-else
-    echo "[*] Creating virtual environment at $VENV_DIR..."
-    "$PYTHON_BIN" -m venv "$VENV_DIR"
 fi
 
-VENV_PYTHON="$VENV_DIR/bin/python3"
-VENV_PIP="$VENV_DIR/bin/pip"
+# Fallback for standard non-developer Mac video editors: Use bundled or download isolated standalone Python 3.11 (Zero permissions / No sudo required)
+if [ -z "$PYTHON_EXE" ]; then
+    ARCH_RAW="$(uname -m)"
+    if [ "$ARCH_RAW" = "arm64" ]; then
+        PY_ARCH="aarch64"
+    else
+        PY_ARCH="x86_64"
+    fi
 
-if [ ! -x "$VENV_PYTHON" ]; then
-    echo "[!] Failed to locate venv python executable at $VENV_PYTHON"
+    INSTALL_TARGET="$DIR/.python311"
+    mkdir -p "$INSTALL_TARGET" 2>/dev/null
+    if [ ! -w "$INSTALL_TARGET" ]; then
+        INSTALL_TARGET="$HOME/.easyspeech/python311"
+        mkdir -p "$INSTALL_TARGET" 2>/dev/null
+    fi
+
+    # Priority 1: Check for local bundled Python archive inside VoiceClonePack (zero download required)
+    LOCAL_TAR=""
+    for cand_tar in \
+        "$DIR/cpython-3.11.9-${PY_ARCH}-apple-darwin.tar.gz" \
+        "$DIR/cpython-3.11.9+20240726-${PY_ARCH}-apple-darwin-install_only.tar.gz" \
+        "$DIR/python-3.11-${PY_ARCH}.tar.gz" \
+        "$DIR/python-mac.tar.gz" \
+        "$DIR/../bin/mac/cpython-3.11.9-${PY_ARCH}-apple-darwin.tar.gz"; do
+        if [ -f "$cand_tar" ]; then
+            LOCAL_TAR="$cand_tar"
+            break
+        fi
+    done
+
+    if [ -n "$LOCAL_TAR" ]; then
+        echo "[PROGRESS:35] Extracting local bundled Python 3.11 for Mac..."
+        echo "[✓] Local bundled Python archive detected: $(basename "$LOCAL_TAR")"
+        echo "[*] Extracting portable runtime into $INSTALL_TARGET (zero internet download required)..."
+        rm -rf "$INSTALL_TARGET"/* 2>/dev/null
+        tar -xzf "$LOCAL_TAR" -C "$INSTALL_TARGET" --strip-components 1
+        if [ -x "$INSTALL_TARGET/bin/python3" ]; then
+            if "$INSTALL_TARGET/bin/python3" -c "import sys; sys.exit(0 if (3, 10) <= sys.version_info < (3, 13) else 1)" >/dev/null 2>&1; then
+                PYTHON_EXE="$INSTALL_TARGET/bin/python3"
+                echo "[✓] Local bundled Python 3.11 extracted and verified successfully."
+            fi
+        fi
+    fi
+
+    # Priority 2: If no local bundled archive was found, download standalone runtime
+    if [ -z "$PYTHON_EXE" ]; then
+        echo "[PROGRESS:30] Downloading official portable Python 3.11 for macOS..."
+        echo "[*] Automatically downloading isolated Python 3.11 runtime (~18 MB, no admin password required)..."
+        PY_URL="https://github.com/indygreg/python-build-standalone/releases/download/20240726/cpython-3.11.9%2B20240726-${PY_ARCH}-apple-darwin-install_only.tar.gz"
+        TMP_TAR="/tmp/cpython_setup_${RANDOM}.tar.gz"
+
+        echo "[*] Downloading standalone runtime..."
+        if curl -fSL --retry 3 --connect-timeout 10 -o "$TMP_TAR" "$PY_URL"; then
+            echo "[*] Extracting portable runtime into $INSTALL_TARGET..."
+            rm -rf "$INSTALL_TARGET"/* 2>/dev/null
+            tar -xzf "$TMP_TAR" -C "$INSTALL_TARGET" --strip-components 1
+            rm -f "$TMP_TAR"
+            if [ -x "$INSTALL_TARGET/bin/python3" ]; then
+                if "$INSTALL_TARGET/bin/python3" -c "import sys; sys.exit(0 if (3, 10) <= sys.version_info < (3, 13) else 1)" >/dev/null 2>&1; then
+                    PYTHON_EXE="$INSTALL_TARGET/bin/python3"
+                    echo "[✓] Standalone Python 3.11 configured successfully (isolated, 0 permissions required)."
+                fi
+            fi
+        else
+            rm -f "$TMP_TAR"
+            echo "[!] Automatic standalone download failed due to network loss."
+        fi
+    fi
+fi
+
+if [ -z "$PYTHON_EXE" ]; then
+    echo "[!] Error: Python 3.10, 3.11, or 3.12 is required (macOS default 3.9 is incompatible with F5-TTS)."
+    echo "    Please install Python 3.11 from https://www.python.org/downloads/macos/ or run 'brew install python@3.11'."
+    if [ "$NO_PAUSE" != "1" ]; then
+        read -p "Press Enter to exit..."
+    fi
     exit 1
 fi
 
+echo "[✓] Using Python: $PYTHON_EXE"
+"$PYTHON_EXE" --version
+echo ""
+
+# -----------------------------------------------------------------------
+# Step 3: Check & Auto-Extract Any Downloaded Model Archives
+# -----------------------------------------------------------------------
+echo "[PROGRESS:55] Checking model archives..."
+echo "[*] Step 3/4: Checking for downloaded model packages..."
+mkdir -p "$DIR/models"
+
+if [ -f "$DIR/models.zip" ]; then
+    echo "[*] Extracting models.zip into models folder..."
+    unzip -o "$DIR/models.zip" -d "$DIR/models" >/dev/null 2>&1
+    echo "[✓] Successfully extracted models.zip."
+fi
+
+if [ -f "$DIR/VoiceClonePack_models.zip" ]; then
+    echo "[*] Extracting VoiceClonePack_models.zip into models folder..."
+    unzip -o "$DIR/VoiceClonePack_models.zip" -d "$DIR/models" >/dev/null 2>&1
+    echo "[✓] Successfully extracted VoiceClonePack_models.zip."
+fi
+
+if [ -d "$DIR/models/hub/models--SWivid--F5-TTS" ]; then
+    echo "[✓] F5-TTS offline neural models detected."
+else
+    echo "[i] Model weights will be automatically fetched on first voice generation."
+fi
+echo ""
+
+# -----------------------------------------------------------------------
+# Step 4: Create Virtual Environment and Install Dependencies
+# -----------------------------------------------------------------------
+echo "[PROGRESS:65] Creating isolated AI environment (.venv)..."
+echo "[*] Step 4/4: Setting up isolated AI environment (.venv)..."
+if [ ! -f "$DIR/.venv/bin/python" ]; then
+    if [ -d "$DIR/.venv" ]; then
+        echo "[*] Cleaning incomplete virtual environment..."
+        rm -rf "$DIR/.venv" 2>/dev/null
+    fi
+    echo "[*] Creating virtual environment at .venv ..."
+    "$PYTHON_EXE" -m venv --clear "$DIR/.venv"
+    if [ $? -ne 0 ]; then
+        echo "[!] Failed to create virtual environment."
+        if [ "$NO_PAUSE" != "1" ]; then
+            read -p "Press Enter to exit..."
+        fi
+        exit 1
+    fi
+    echo "[✓] Virtual environment created."
+else
+    echo "[✓] Existing virtual environment detected at .venv."
+fi
+
+VENV_PY="$DIR/.venv/bin/python"
+
+echo ""
 echo "[*] Upgrading pip, setuptools, and wheel..."
-"$VENV_PYTHON" -m pip install --upgrade pip setuptools wheel
-
-# 5. Install PyTorch with native Apple Metal (MPS) support
-echo ""
-echo "[*] Installing PyTorch (with Apple Silicon Metal/MPS support)..."
-"$VENV_PIP" install "torch>=2.5.0" torchvision "torchaudio>=2.5.0"
-
-# 6. Install F5-TTS, Faster-Whisper, and Audio Processing packages
-echo ""
-echo "[*] Installing F5-TTS, Faster-Whisper, SoundFile, and audio processing tools..."
-"$VENV_PIP" install f5-tts faster-whisper soundfile imageio_ffmpeg pydub
-
-# 7. Make helper scripts executable
-chmod +x "$SCRIPT_DIR/start_service.sh" 2>/dev/null || true
-chmod +x "$SCRIPT_DIR/install_service.sh" 2>/dev/null || true
-chmod +x "$VENV_PYTHON" 2>/dev/null || true
-
-# 8. Verify installation
-echo ""
-echo "[*] Verifying installation..."
-"$VENV_PYTHON" -c "
-import sys
-import torch
-import soundfile
-import f5_tts
-import faster_whisper
-
-mps = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
-cuda = torch.cuda.is_available()
-dev = 'CUDA' if cuda else ('Apple Metal (MPS)' if mps else 'CPU')
-print(f'[✓] All dependencies imported successfully!')
-print(f'[✓] Active Compute Acceleration: {dev}')
-"
+"$VENV_PY" -m pip install --upgrade pip setuptools wheel --retries 10 --timeout 60 2>/dev/null || true
 
 echo ""
-echo "========================================================"
-echo "  INSTALLATION COMPLETED SUCCESSFULLY!"
-echo "========================================================"
-echo "Easy Speech in Premiere Pro / After Effects will now automatically"
-echo "spawn this Voice Clone service in the background whenever needed."
+echo "[PROGRESS:75] Installing PyTorch with Metal acceleration (takes ~10-15 mins)..."
+echo "[*] Installing PyTorch with Metal MPS acceleration..."
+echo "    (This package is ~2 GB and typically takes 10-15 minutes depending on your internet speed)"
+"$VENV_PY" -m pip install torch torchvision torchaudio --retries 10 --timeout 60
+if [ $? -ne 0 ]; then
+    echo "[!] ERROR: Failed to install PyTorch. Network connection may have dropped."
+    if [ "$NO_PAUSE" != "1" ]; then
+        read -p "Press Enter to exit..."
+    fi
+    exit 1
+fi
+
 echo ""
-echo "You can also manually start the service at any time by running:"
-echo "    ./start_service.sh"
-echo "========================================================"
+echo "[PROGRESS:88] Installing F5-TTS Neural Diffusion and Whisper..."
+echo "[*] Installing F5-TTS, Faster-Whisper, soundfile, and audio libraries..."
+"$VENV_PY" -m pip install f5-tts faster-whisper soundfile imageio_ffmpeg pydub --retries 10 --timeout 60
+if [ $? -ne 0 ]; then
+    echo "[!] ERROR: Failed to install F5-TTS dependencies. Download interrupted."
+    if [ "$NO_PAUSE" != "1" ]; then
+        read -p "Press Enter to exit..."
+    fi
+    exit 1
+fi
+
+echo ""
+echo "[PROGRESS:95] Verifying AI runtime engine..."
+echo "[*] Verifying all installed AI packages..."
+"$VENV_PY" -c "import torch, f5_tts, faster_whisper; print('[✓] Packages verified')"
+if [ $? -ne 0 ]; then
+    echo "[!] ERROR: Package verification failed. One or more packages are incomplete."
+    if [ "$NO_PAUSE" != "1" ]; then
+        read -p "Press Enter to exit..."
+    fi
+    exit 1
+fi
+
+# Create verified completion marker file
+echo "1.0.0" > "$DIR/.installed_success"
+
+echo ""
+echo "[PROGRESS:100] Installation Complete!"
+echo "======================================================================"
+echo "              INSTALLATION COMPLETED SUCCESSFULLY!"
+echo "======================================================================"
+echo "Voice Clone Pack is now ready on your Mac."
+echo ""
+echo "Next Steps:"
+echo " 1. You can launch './start_service.sh' to start the service manually, OR"
+echo " 2. Open Easy Speech inside Premiere Pro / After Effects."
+echo "    Easy Speech will automatically detect and launch this service for you!"
+echo "======================================================================"
+echo ""
+if [ "$NO_PAUSE" != "1" ]; then
+    read -p "Press Enter to exit..."
+fi
+exit 0
