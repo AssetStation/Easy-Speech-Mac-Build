@@ -37,9 +37,9 @@ echo "[*] Starting Voice Clone Service on http://127.0.0.1:8765 ..."
 echo "[*] Keep this window open while using Voice Cloning in Premiere Pro / After Effects."
 echo ""
 if [ -f "$DIR/service.pyc" ]; then
-    "$PYTHON_EXE" "$DIR/service.pyc"
+    "$PYTHON_EXE" "$DIR/service.pyc" "$@"
 else
-    "$PYTHON_EXE" "$DIR/service.py"
+    "$PYTHON_EXE" "$DIR/service.py" "$@"
 fi
 if [ $? -ne 0 ]; then
     echo ""
