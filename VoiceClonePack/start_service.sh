@@ -9,24 +9,24 @@ echo "========================================================"
 echo "  EASY SPEECH: VOICE CLONE EXPANSION SERVICE (macOS)"
 echo "========================================================"
 
+unset PYTHONPATH
+unset PYTHONHOME
+unset PYTHONUSERSITE
+
 PYTHON_EXE=""
-if [ -f "$DIR/.venv/bin/python" ]; then
-    PYTHON_EXE="$DIR/.venv/bin/python"
-elif [ -f "$DIR/.venv/bin/python3" ]; then
-    PYTHON_EXE="$DIR/.venv/bin/python3"
-elif [ -f "$DIR/.python311/bin/python3" ]; then
-    PYTHON_EXE="$DIR/.python311/bin/python3"
-elif [ -f "$HOME/.easyspeech/python311/bin/python3" ]; then
-    PYTHON_EXE="$HOME/.easyspeech/python311/bin/python3"
-elif [ -f "$HOME/.easyspeech/venv/bin/python3" ]; then
-    PYTHON_EXE="$HOME/.easyspeech/venv/bin/python3"
-else
-    PYTHON_EXE="$(which python3 2>/dev/null || echo '')"
-fi
+for cand in "$DIR/.venv/bin/python" "$DIR/.venv/bin/python3" "$DIR/.python311/bin/python3" "$HOME/.easyspeech/python311/bin/python3" "$HOME/.easyspeech/venv/bin/python3"; do
+    if [ -n "$cand" ] && [ -x "$cand" ]; then
+        if "$cand" -c "import sys; sys.exit(0 if sys.version_info[:2] == (3, 11) else 1)" >/dev/null 2>&1; then
+            PYTHON_EXE="$cand"
+            break
+        fi
+    fi
+done
 
 if [ -z "$PYTHON_EXE" ]; then
-    echo "[!] ERROR: Python virtual environment not found."
+    echo "[!] ERROR: Dedicated Python 3.11 environment not found."
     echo "Please run './install_service.sh' first to set up the expansion pack."
+    echo "(System Python versions like 3.12, 3.13, 3.14 are incompatible with bundled AI binaries)."
     echo ""
     read -p "Press Enter to exit..."
     exit 1

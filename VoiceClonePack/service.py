@@ -9,6 +9,8 @@ import time
 import json
 import threading
 import subprocess
+import hmac
+import hashlib
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 # Ensure PyTorch enables CPU fallback for unsupported MPS operators on Apple Silicon
@@ -54,6 +56,20 @@ if not os.path.exists(MODELS_DIR):
 if os.path.exists(MODELS_DIR):
     os.environ["HF_HOME"] = os.path.abspath(MODELS_DIR)
 
+CLONE_CACHE_DIR = os.path.join(EXT_ROOT, "cloned_profiles", ".cache")
+try:
+    os.makedirs(CLONE_CACHE_DIR, exist_ok=True)
+except Exception:
+    import tempfile
+    CLONE_CACHE_DIR = os.path.join(tempfile.gettempdir(), "EasySpeech_cache")
+    os.makedirs(CLONE_CACHE_DIR, exist_ok=True)
+
+OUTPUT_DIR = os.path.join(EXT_ROOT, "audio_outputs")
+try:
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+except Exception:
+    pass
+
 # Global State
 START_TIME = time.time()
 LAST_HEARTBEAT_TIME = time.time()
@@ -82,6 +98,77 @@ def finish_active_task():
 def is_currently_processing():
     with ACTIVE_TASKS_LOCK:
         return ACTIVE_TASKS > 0
+
+# ---------------------------------------------------------------------------
+# 🛡️ Cryptographic License Authorization Verification
+# ---------------------------------------------------------------------------
+_ES_HANDSHAKE_PEPPER = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+def verify_license_token(token, timestamp, bucket):
+    if not token or not timestamp:
+        return False, "Missing security execution token."
+
+    now_ms = time.time() * 1000
+    try:
+        ts_val = float(timestamp)
+    except (ValueError, TypeError):
+        return False, "Invalid token timestamp."
+
+    if abs(now_ms - ts_val) > 15 * 60 * 1000:
+        return False, "Execution session expired. Please retry synthesis."
+
+    if sys.platform == "darwin":
+        session_file = os.path.expanduser("~/Library/Application Support/EasySpeech/.es_session")
+    else:
+        appdata = os.environ.get("APPDATA") or os.path.expanduser("~\\AppData\\Roaming")
+        session_file = os.path.join(appdata, "EasySpeech", ".es_session")
+
+    if not os.path.exists(session_file):
+        return False, "Active license session not found. Please activate Easy Speech."
+
+    try:
+        with open(session_file, "r", encoding="utf-8") as sf:
+            lines = [l.strip() for l in sf if l.strip()]
+        if len(lines) < 3:
+            return False, "Corrupted license session file."
+
+        key_hex, hwid, verification_sig = lines[0], lines[1], lines[2]
+
+        expected_sig = hmac.new(
+            bytes.fromhex(_ES_HANDSHAKE_PEPPER),
+            f"{key_hex}:{hwid}".encode("utf-8"),
+            hashlib.sha256
+        ).hexdigest()
+
+        fallback_sig = hmac.new(
+            bytes.fromhex(_ES_HANDSHAKE_PEPPER),
+            f"{key_hex}:".encode("utf-8"),
+            hashlib.sha256
+        ).hexdigest()
+
+        if verification_sig != expected_sig and verification_sig != fallback_sig:
+            return False, "License session tampering detected."
+
+        session_key = bytes.fromhex(key_hex)
+        try:
+            target_bucket = int(bucket) if bucket is not None else int(ts_val / (1000 * 60 * 15))
+        except (ValueError, TypeError):
+            target_bucket = int(ts_val / (1000 * 60 * 15))
+
+        valid = False
+        for b in [target_bucket, target_bucket - 1, target_bucket + 1]:
+            data = f"{hwid}:{b}:Easy Speech".encode("utf-8")
+            expected_token = hmac.new(session_key, data, hashlib.sha256).hexdigest()
+            if hmac.compare_digest(str(token), expected_token):
+                valid = True
+                break
+
+        if not valid:
+            return False, "Cryptographic authorization token mismatch."
+
+        return True, ""
+    except Exception as e:
+        return False, f"Token verification error: {str(e)}"
 
 _f5_instance = None
 _whisper_instance = None
@@ -132,7 +219,19 @@ def get_ffmpeg_path():
     except Exception:
         pass
 
-    # 2. Check system PATH
+    # 2. Check explicit standard Mac locations (Apple Silicon & Intel)
+    if sys.platform == "darwin":
+        mac_paths = [
+            "/opt/homebrew/bin/ffmpeg",  # Apple Silicon (M1/M2/M3/M4) Homebrew
+            "/usr/local/bin/ffmpeg",      # Intel Mac Homebrew
+            "/opt/local/bin/ffmpeg"       # MacPorts
+        ]
+        for mp in mac_paths:
+            if os.path.exists(mp) and os.access(mp, os.X_OK):
+                _ffmpeg_exe_path = mp
+                return _ffmpeg_exe_path
+
+    # 3. Check system PATH
     try:
         which_cmd = ["where", "ffmpeg"] if sys.platform == "win32" else ["which", "ffmpeg"]
         res = subprocess.run(which_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -146,15 +245,37 @@ def get_ffmpeg_path():
 
     return "ffmpeg"
 
+def get_clean_24k_cache_path(source_path):
+    """Returns a deterministic safe cache path inside the internal plugin cache directory."""
+    try:
+        norm = os.path.normpath(source_path)
+        base_name = os.path.splitext(os.path.basename(source_path))[0]
+        import re
+        safe_base = re.sub(r'[^a-zA-Z0-9_\-]', '_', base_name)[:30].strip('_') or "audio"
+        mtime = os.path.getmtime(source_path) if os.path.exists(source_path) else 0
+        h = hashlib.md5(f"{norm}:{mtime}".encode("utf-8")).hexdigest()[:10]
+        return os.path.join(CLONE_CACHE_DIR, f"{safe_base}_{h}_clean24k.wav")
+    except Exception:
+        h = hashlib.md5(str(source_path).encode("utf-8")).hexdigest()[:12]
+        return os.path.join(CLONE_CACHE_DIR, f"ref_{h}_clean24k.wav")
+
+def get_optref_cache_path(clean_audio_path):
+    """Returns safe cache path for trimmed reference audio inside internal plugin cache directory."""
+    base_name = os.path.splitext(os.path.basename(clean_audio_path))[0]
+    return os.path.join(CLONE_CACHE_DIR, f"{base_name}_optref.wav")
+
 def convert_audio_to_24k_mono_wav(source_path, target_path=None):
-    """Converts any audio file (m4a, mp3, ogg, wav) to clean 24kHz mono PCM WAV."""
+    """Converts any audio file to clean 24kHz mono PCM WAV inside the plugin internal cache directory."""
     init_environment()
     if not os.path.exists(source_path):
         raise FileNotFoundError(f"Source audio file not found: {source_path}")
 
     if not target_path:
-        base, _ = os.path.splitext(source_path)
-        target_path = base + "_clean24k.wav"
+        target_path = get_clean_24k_cache_path(source_path)
+
+    # Reuse cached converted file if it already exists
+    if os.path.exists(target_path) and os.path.getsize(target_path) > 1024:
+        return target_path
 
     os.makedirs(os.path.dirname(os.path.abspath(target_path)), exist_ok=True)
 
@@ -163,6 +284,7 @@ def convert_audio_to_24k_mono_wav(source_path, target_path=None):
         ffmpeg_exe,
         "-y",
         "-i", source_path,
+        "-vn",
         "-ar", "24000",
         "-ac", "1",
         "-c:a", "pcm_s16le",
@@ -529,10 +651,20 @@ class VoiceCloneRequestHandler(BaseHTTPRequestHandler):
             start_active_task()
             t0 = time.time()
             try:
-                # Pre-convert to WAV if non-WAV container
+                # Pre-convert to WAV if non-WAV container or non-standard sample rate/channels
                 ext = os.path.splitext(audio_path)[1].lower()
                 clean_audio = audio_path
-                if ext != ".wav":
+                needs_convert = (ext != ".wav")
+                if not needs_convert:
+                    try:
+                        import soundfile as _sf
+                        _info = _sf.info(audio_path)
+                        if _info.samplerate != 24000 or _info.channels != 1:
+                            needs_convert = True
+                    except Exception:
+                        needs_convert = True
+
+                if needs_convert:
                     clean_audio = convert_audio_to_24k_mono_wav(audio_path)
 
                 with MODEL_LOCK:
@@ -559,8 +691,7 @@ class VoiceCloneRequestHandler(BaseHTTPRequestHandler):
                             import soundfile as sf
                             a_data, a_sr = sf.read(clean_audio)
                             trimmed_data = a_data[:int(cutoff_sec * a_sr)]
-                            base_no_ext, _ = os.path.splitext(clean_audio)
-                            opt_path = base_no_ext + "_optref.wav"
+                            opt_path = get_optref_cache_path(clean_audio)
                             sf.write(opt_path, trimmed_data, a_sr)
                             clean_audio = opt_path
                             text = " ".join([s.text.strip() for s in selected_segs]).strip()
@@ -601,6 +732,14 @@ class VoiceCloneRequestHandler(BaseHTTPRequestHandler):
 
         # 3. High-Speed Synthesis Endpoint (Protected by MODEL_LOCK with OOM Recovery)
         elif path == "/api/generate":
+            token = data.get("token")
+            timestamp = data.get("timestamp")
+            bucket = data.get("bucket")
+            is_valid, auth_err = verify_license_token(token, timestamp, bucket)
+            if not is_valid:
+                self._send_json_response(401, {"success": False, "error": f"Unauthorized: {auth_err}"})
+                return
+
             text = (data.get("text") or "").strip()
             ref_audio = data.get("ref_audio")
             ref_text = (data.get("ref_text") or "").strip()
@@ -623,10 +762,19 @@ class VoiceCloneRequestHandler(BaseHTTPRequestHandler):
                 import soundfile as sf
                 import re
 
-                # Ensure reference audio is 24kHz mono WAV
+                # Ensure reference audio is clean 24kHz mono WAV
                 ext = os.path.splitext(ref_audio)[1].lower()
                 clean_ref_audio = ref_audio
-                if ext != ".wav":
+                needs_convert = (ext != ".wav")
+                if not needs_convert:
+                    try:
+                        _info = sf.info(ref_audio)
+                        if _info.samplerate != 24000 or _info.channels != 1:
+                            needs_convert = True
+                    except Exception:
+                        needs_convert = True
+
+                if needs_convert:
                     clean_ref_audio = convert_audio_to_24k_mono_wav(ref_audio)
 
                 # Duration guard: F5-TTS silently chops reference audio > 12s, causing leftover
@@ -635,8 +783,7 @@ class VoiceCloneRequestHandler(BaseHTTPRequestHandler):
                 try:
                     ref_info = sf.info(clean_ref_audio)
                     if ref_info.duration > 10.0:
-                        base_no_ext, _ = os.path.splitext(clean_ref_audio)
-                        opt_path = base_no_ext + "_optref.wav"
+                        opt_path = get_optref_cache_path(clean_ref_audio)
                         if os.path.exists(opt_path):
                             clean_ref_audio = opt_path
                         else:
@@ -676,8 +823,7 @@ class VoiceCloneRequestHandler(BaseHTTPRequestHandler):
                 # Generate output path if not specified
                 if not output_path:
                     ts = int(time.time() * 1000)
-                    out_dir = os.path.dirname(os.path.abspath(clean_ref_audio))
-                    output_path = os.path.join(out_dir, f"clone_gen_{ts}.wav")
+                    output_path = os.path.join(OUTPUT_DIR, f"clone_gen_{ts}.wav")
 
                 os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
@@ -694,8 +840,7 @@ class VoiceCloneRequestHandler(BaseHTTPRequestHandler):
                                 cfg_strength=cfg_strength
                             )
                     except Exception as infer_err:
-                        err_str = str(infer_err).lower()
-                        is_oom = "out of memory" in err_str or "cuda error: out of memory" in err_str or "mps backend out of memory" in err_str
+                        is_oom = "out of memory" in err_str or "cuda error: out of memory" in err_str or "mps backend out of memory" in err_str or isinstance(infer_err, MemoryError)
                         if is_oom or (hasattr(torch.cuda, "OutOfMemoryError") and isinstance(infer_err, torch.cuda.OutOfMemoryError)):
                             try:
                                 if torch.cuda.is_available():
@@ -707,7 +852,7 @@ class VoiceCloneRequestHandler(BaseHTTPRequestHandler):
                             self._send_json_response(422, {
                                 "success": False,
                                 "is_oom": True,
-                                "error": "Insufficient free GPU VRAM. Pause timeline playback or rendering in Premiere Pro / After Effects and try again."
+                                "error": "Insufficient free memory (RAM / VRAM). Close background applications or pause Premiere Pro playback and try again."
                             })
                             return
                         raise infer_err

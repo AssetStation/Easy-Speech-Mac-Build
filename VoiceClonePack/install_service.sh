@@ -6,6 +6,11 @@ cd "$DIR"
 export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/Library/Frameworks/Python.framework/Versions/Current/bin:$PATH"
 export PYTORCH_ENABLE_MPS_FALLBACK=1
 
+# Sanitize Python environment variables to prevent external Python versions (e.g., Python 3.14) from interfering
+unset PYTHONPATH
+unset PYTHONHOME
+unset PYTHONUSERSITE
+
 NO_PAUSE=0
 if [ "$1" = "--no-pause" ]; then
     NO_PAUSE=1
@@ -24,7 +29,7 @@ rm -f "$DIR/.installed_success" 2>/dev/null
 if [ -f "$DIR/.venv/bin/python" ]; then
     echo "[PROGRESS:15] Checking existing AI environment integrity..."
     echo "[*] Checking health of existing Voice Clone installation..."
-    if "$DIR/.venv/bin/python" -c "import torch, f5_tts, faster_whisper" >/dev/null 2>&1; then
+    if "$DIR/.venv/bin/python" -c "import sys, torch, f5_tts, faster_whisper; assert sys.version_info[:2] == (3, 11), 'Python 3.11 required'" >/dev/null 2>&1; then
         echo "[HEALTH_CHECK:PASSED]"
         echo "[PROGRESS:100] All AI packages are healthy and verified!"
         echo "[✓] Fast Health Check Passed: All AI packages are already installed and 100% functional!"
@@ -111,12 +116,12 @@ echo ""
 # Step 2: Check or Auto-Install Standalone Python
 # -----------------------------------------------------------------------
 echo "[PROGRESS:25] Checking Python environment..."
-echo "[*] Step 2/4: Checking Python 3.10 / 3.11 / 3.12 installation..."
+echo "[*] Step 2/4: Checking Python 3.11 installation..."
 PYTHON_EXE=""
 
-for cand in "$DIR/.python311/bin/python3" "$HOME/.easyspeech/python311/bin/python3" "/opt/homebrew/bin/python3.12" "/opt/homebrew/bin/python3.11" "/opt/homebrew/bin/python3.10" "/opt/homebrew/bin/python3" "/usr/local/bin/python3.12" "/usr/local/bin/python3.11" "/usr/local/bin/python3.10" "/usr/local/bin/python3" "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3" "/Library/Frameworks/Python.framework/Versions/3.11/bin/python3" "/Library/Frameworks/Python.framework/Versions/3.10/bin/python3" "$(which python3 2>/dev/null)"; do
+for cand in "$DIR/.python311/bin/python3" "$HOME/.easyspeech/python311/bin/python3" "/opt/homebrew/bin/python3.11" "/usr/local/bin/python3.11" "/Library/Frameworks/Python.framework/Versions/3.11/bin/python3"; do
     if [ -n "$cand" ] && [ -x "$cand" ]; then
-        if "$cand" -c "import sys; sys.exit(0 if (3, 10) <= sys.version_info < (3, 13) else 1)" >/dev/null 2>&1; then
+        if "$cand" -c "import sys; sys.exit(0 if sys.version_info[:2] == (3, 11) else 1)" >/dev/null 2>&1; then
             PYTHON_EXE="$cand"
             break
         fi
@@ -124,13 +129,13 @@ for cand in "$DIR/.python311/bin/python3" "$HOME/.easyspeech/python311/bin/pytho
 done
 
 if [ -z "$PYTHON_EXE" ]; then
-    echo "[!] No existing Python 3.10+ detected on your Mac."
+    echo "[!] No existing Python 3.11 detected on your Mac."
     if which brew >/dev/null 2>&1; then
         echo "[PROGRESS:35] Installing Python 3.11 via Homebrew..."
         brew install python@3.11 2>/dev/null
-        for b_cand in "/opt/homebrew/bin/python3.11" "/usr/local/bin/python3.11" "$(which python3 2>/dev/null)"; do
+        for b_cand in "/opt/homebrew/bin/python3.11" "/usr/local/bin/python3.11"; do
             if [ -n "$b_cand" ] && [ -x "$b_cand" ]; then
-                if "$b_cand" -c "import sys; sys.exit(0 if (3, 10) <= sys.version_info < (3, 13) else 1)" >/dev/null 2>&1; then
+                if "$b_cand" -c "import sys; sys.exit(0 if sys.version_info[:2] == (3, 11) else 1)" >/dev/null 2>&1; then
                     PYTHON_EXE="$b_cand"
                     break
                 fi
@@ -176,7 +181,7 @@ if [ -z "$PYTHON_EXE" ]; then
         rm -rf "$INSTALL_TARGET"/* 2>/dev/null
         tar -xzf "$LOCAL_TAR" -C "$INSTALL_TARGET" --strip-components 1
         if [ -x "$INSTALL_TARGET/bin/python3" ]; then
-            if "$INSTALL_TARGET/bin/python3" -c "import sys; sys.exit(0 if (3, 10) <= sys.version_info < (3, 13) else 1)" >/dev/null 2>&1; then
+            if "$INSTALL_TARGET/bin/python3" -c "import sys; sys.exit(0 if sys.version_info[:2] == (3, 11) else 1)" >/dev/null 2>&1; then
                 PYTHON_EXE="$INSTALL_TARGET/bin/python3"
                 echo "[✓] Local bundled Python 3.11 extracted and verified successfully."
             fi
@@ -197,7 +202,7 @@ if [ -z "$PYTHON_EXE" ]; then
             tar -xzf "$TMP_TAR" -C "$INSTALL_TARGET" --strip-components 1
             rm -f "$TMP_TAR"
             if [ -x "$INSTALL_TARGET/bin/python3" ]; then
-                if "$INSTALL_TARGET/bin/python3" -c "import sys; sys.exit(0 if (3, 10) <= sys.version_info < (3, 13) else 1)" >/dev/null 2>&1; then
+                if "$INSTALL_TARGET/bin/python3" -c "import sys; sys.exit(0 if sys.version_info[:2] == (3, 11) else 1)" >/dev/null 2>&1; then
                     PYTHON_EXE="$INSTALL_TARGET/bin/python3"
                     echo "[✓] Standalone Python 3.11 configured successfully (isolated, 0 permissions required)."
                 fi
@@ -305,8 +310,9 @@ fi
 
 echo ""
 echo "[PROGRESS:95] Verifying AI runtime engine..."
-echo "[*] Verifying all installed AI packages..."
-"$VENV_PY" -c "import torch, f5_tts, faster_whisper; print('[✓] Packages verified')"
+echo "[*] Verifying all installed AI packages and portable FFmpeg..."
+find "$DIR/.venv" -name "ffmpeg*" -type f -exec chmod +x {} + 2>/dev/null || true
+"$VENV_PY" -c "import torch, f5_tts, faster_whisper, imageio_ffmpeg; print('[✓] AI packages verified. FFmpeg binary:', imageio_ffmpeg.get_ffmpeg_exe())"
 if [ $? -ne 0 ]; then
     echo "[!] ERROR: Package verification failed. One or more packages are incomplete."
     if [ "$NO_PAUSE" != "1" ]; then
