@@ -52,6 +52,8 @@ else:
 
 import time
 import uuid
+import hmac
+import hashlib
 import numpy as np
 import soundfile as sf
 
@@ -97,7 +99,14 @@ try:
         from pydub import AudioSegment
         AudioSegment.converter = _ffmpeg_bin
 except Exception:
-    pass
+    if sys.platform == "darwin":
+        for _mp in ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/opt/local/bin/ffmpeg"]:
+            if os.path.exists(_mp) and os.access(_mp, os.X_OK):
+                _ffmpeg_bin = _mp
+                _ffmpeg_dir = os.path.dirname(_mp)
+                if _ffmpeg_dir not in os.environ.get("PATH", ""):
+                    os.environ["PATH"] = _ffmpeg_dir + os.path.pathsep + os.environ.get("PATH", "")
+                break
 
 def get_f5_model():
     global f5_instance
@@ -151,8 +160,81 @@ def run_cli():
     parser.add_argument("--speed", type=float, default=1.0, help="Speaking speed")
     parser.add_argument("--output", type=str, default=None, help="Explicit output wav path")
     parser.add_argument("--result-json", type=str, default=None, help="Path to write JSON metadata")
+    parser.add_argument("--token", type=str, default=None, help="Security authorization token")
+    parser.add_argument("--timestamp", type=int, default=None, help="Token timestamp")
+    parser.add_argument("--bucket", type=int, default=None, help="Token time bucket")
 
     args, _ = parser.parse_known_args()
+
+    # -----------------------------------------------------------------------
+    # 🛡️ Cryptographic License Authorization Verification
+    # -----------------------------------------------------------------------
+    _ES_HANDSHAKE_PEPPER = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+    def fail_auth(error_message):
+        err_res = {"success": False, "error": error_message}
+        if args.result_json:
+            try:
+                with open(args.result_json, "w", encoding="utf-8") as f:
+                    json.dump(err_res, f)
+            except Exception: pass
+        print(json.dumps(err_res))
+        sys.exit(1)
+
+    if not args.token or not args.timestamp:
+        fail_auth("Execution unauthorized: Valid license security token required.")
+
+    now_ms = time.time() * 1000
+    if abs(now_ms - args.timestamp) > 15 * 60 * 1000:
+        fail_auth("Execution session expired. Please click Preview or Insert again.")
+
+    if sys.platform == "darwin":
+        session_file = os.path.expanduser("~/Library/Application Support/EasySpeech/.es_session")
+    else:
+        appdata = os.environ.get("APPDATA") or os.path.expanduser("~\\AppData\\Roaming")
+        session_file = os.path.join(appdata, "EasySpeech", ".es_session")
+
+    if not os.path.exists(session_file):
+        fail_auth("Unauthorized: No active license session found. Please activate Easy Speech.")
+
+    try:
+        with open(session_file, "r", encoding="utf-8") as sf_handle:
+            session_lines = [l.strip() for l in sf_handle if l.strip()]
+        if len(session_lines) < 3:
+            fail_auth("License session file corrupted. Please re-open Easy Speech.")
+
+        key_hex, hwid, verification_sig = session_lines[0], session_lines[1], session_lines[2]
+
+        expected_sig = hmac.new(
+            bytes.fromhex(_ES_HANDSHAKE_PEPPER),
+            f"{key_hex}:{hwid}".encode("utf-8"),
+            hashlib.sha256
+        ).hexdigest()
+
+        fallback_sig = hmac.new(
+            bytes.fromhex(_ES_HANDSHAKE_PEPPER),
+            f"{key_hex}:".encode("utf-8"),
+            hashlib.sha256
+        ).hexdigest()
+
+        if verification_sig != expected_sig and verification_sig != fallback_sig:
+            fail_auth("License session integrity check failed. Tampering detected.")
+
+        session_key = bytes.fromhex(key_hex)
+        target_bucket = args.bucket if args.bucket is not None else int(args.timestamp / (1000 * 60 * 15))
+
+        token_valid = False
+        for b in [target_bucket, target_bucket - 1, target_bucket + 1]:
+            data = f"{hwid}:{b}:Easy Speech".encode("utf-8")
+            expected_token = hmac.new(session_key, data, hashlib.sha256).hexdigest()
+            if hmac.compare_digest(args.token, expected_token):
+                token_valid = True
+                break
+
+        if not token_valid:
+            fail_auth("Cryptographic authorization token mismatch. Synthesis denied.")
+    except Exception as auth_ex:
+        fail_auth(f"License verification error: {str(auth_ex)}")
 
     text = ""
     if args.text_file and os.path.exists(args.text_file):
@@ -275,8 +357,10 @@ def run_cli():
                     try:
                         import imageio_ffmpeg, subprocess
                         ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
-                        clean_ref = os.path.splitext(ref_audio)[0] + "_24k.wav"
-                        subprocess.run([ffmpeg_bin, "-y", "-i", ref_audio, "-ar", "24000", "-ac", "1", clean_ref], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                        cache_dir = os.path.join(BASE_DIR, "cloned_profiles", ".cache")
+                        os.makedirs(cache_dir, exist_ok=True)
+                        clean_ref = os.path.join(cache_dir, os.path.splitext(os.path.basename(ref_audio))[0] + "_24k.wav")
+                        subprocess.run([ffmpeg_bin, "-y", "-i", ref_audio, "-vn", "-ar", "24000", "-ac", "1", clean_ref], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                     except Exception:
                         clean_ref = ref_audio
 
