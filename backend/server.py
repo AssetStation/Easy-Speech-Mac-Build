@@ -160,81 +160,8 @@ def run_cli():
     parser.add_argument("--speed", type=float, default=1.0, help="Speaking speed")
     parser.add_argument("--output", type=str, default=None, help="Explicit output wav path")
     parser.add_argument("--result-json", type=str, default=None, help="Path to write JSON metadata")
-    parser.add_argument("--token", type=str, default=None, help="Security authorization token")
-    parser.add_argument("--timestamp", type=int, default=None, help="Token timestamp")
-    parser.add_argument("--bucket", type=int, default=None, help="Token time bucket")
 
     args, _ = parser.parse_known_args()
-
-    # -----------------------------------------------------------------------
-    # 🛡️ Cryptographic License Authorization Verification
-    # -----------------------------------------------------------------------
-    _ES_HANDSHAKE_PEPPER = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-
-    def fail_auth(error_message):
-        err_res = {"success": False, "error": error_message}
-        if args.result_json:
-            try:
-                with open(args.result_json, "w", encoding="utf-8") as f:
-                    json.dump(err_res, f)
-            except Exception: pass
-        print(json.dumps(err_res))
-        sys.exit(1)
-
-    if not args.token or not args.timestamp:
-        fail_auth("Execution unauthorized: Valid license security token required.")
-
-    now_ms = time.time() * 1000
-    if abs(now_ms - args.timestamp) > 15 * 60 * 1000:
-        fail_auth("Execution session expired. Please click Preview or Insert again.")
-
-    if sys.platform == "darwin":
-        session_file = os.path.expanduser("~/Library/Application Support/EasySpeech/.es_session")
-    else:
-        appdata = os.environ.get("APPDATA") or os.path.expanduser("~\\AppData\\Roaming")
-        session_file = os.path.join(appdata, "EasySpeech", ".es_session")
-
-    if not os.path.exists(session_file):
-        fail_auth("Unauthorized: No active license session found. Please activate Easy Speech.")
-
-    try:
-        with open(session_file, "r", encoding="utf-8") as sf_handle:
-            session_lines = [l.strip() for l in sf_handle if l.strip()]
-        if len(session_lines) < 3:
-            fail_auth("License session file corrupted. Please re-open Easy Speech.")
-
-        key_hex, hwid, verification_sig = session_lines[0], session_lines[1], session_lines[2]
-
-        expected_sig = hmac.new(
-            bytes.fromhex(_ES_HANDSHAKE_PEPPER),
-            f"{key_hex}:{hwid}".encode("utf-8"),
-            hashlib.sha256
-        ).hexdigest()
-
-        fallback_sig = hmac.new(
-            bytes.fromhex(_ES_HANDSHAKE_PEPPER),
-            f"{key_hex}:".encode("utf-8"),
-            hashlib.sha256
-        ).hexdigest()
-
-        if verification_sig != expected_sig and verification_sig != fallback_sig:
-            fail_auth("License session integrity check failed. Tampering detected.")
-
-        session_key = bytes.fromhex(key_hex)
-        target_bucket = args.bucket if args.bucket is not None else int(args.timestamp / (1000 * 60 * 15))
-
-        token_valid = False
-        for b in [target_bucket, target_bucket - 1, target_bucket + 1]:
-            data = f"{hwid}:{b}:Easy Speech".encode("utf-8")
-            expected_token = hmac.new(session_key, data, hashlib.sha256).hexdigest()
-            if hmac.compare_digest(args.token, expected_token):
-                token_valid = True
-                break
-
-        if not token_valid:
-            fail_auth("Cryptographic authorization token mismatch. Synthesis denied.")
-    except Exception as auth_ex:
-        fail_auth(f"License verification error: {str(auth_ex)}")
 
     text = ""
     if args.text_file and os.path.exists(args.text_file):
@@ -338,7 +265,8 @@ def run_cli():
                     data=_json.dumps(daemon_req).encode("utf-8"),
                     headers={"Content-Type": "application/json"}
                 )
-                with urllib.request.urlopen(req, timeout=120) as daemon_resp:
+                # Generous 300s timeout to allow long paragraphs to complete synthesis smoothly
+                with urllib.request.urlopen(req, timeout=300) as daemon_resp:
                     res_obj = _json.loads(daemon_resp.read().decode("utf-8"))
                     if res_obj.get("success"):
                         duration = float(res_obj.get("duration", 0.0))
@@ -387,6 +315,11 @@ def run_cli():
 
                 if samples is None or len(samples) == 0:
                     raise RuntimeError("Voice cloning inference returned empty audio.")
+
+                # Studio Peak Normalization: prevent digital clipping/distortion
+                max_amp = float(np.max(np.abs(samples)))
+                if max_amp > 0.95:
+                    samples = samples * (0.95 / max_amp)
 
                 sf.write(output_filepath, samples, sample_rate)
                 duration = float(len(samples)) / float(sample_rate)
