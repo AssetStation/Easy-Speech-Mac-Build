@@ -80,6 +80,21 @@ PARENT_PID = None
 # Active Processing State (guards against premature timeouts during long script synthesis)
 ACTIVE_TASKS = 0
 ACTIVE_TASKS_LOCK = threading.Lock()
+_ACTIVE_OP = None
+
+def try_acquire_operation(op_name):
+    global _ACTIVE_OP
+    with ACTIVE_TASKS_LOCK:
+        if _ACTIVE_OP is not None:
+            return False, _ACTIVE_OP
+        _ACTIVE_OP = op_name
+        return True, None
+
+def release_operation(op_name):
+    global _ACTIVE_OP
+    with ACTIVE_TASKS_LOCK:
+        if _ACTIVE_OP == op_name:
+            _ACTIVE_OP = None
 
 def start_active_task():
     global ACTIVE_TASKS, LAST_HEARTBEAT_TIME
@@ -98,77 +113,6 @@ def finish_active_task():
 def is_currently_processing():
     with ACTIVE_TASKS_LOCK:
         return ACTIVE_TASKS > 0
-
-# ---------------------------------------------------------------------------
-# 🛡️ Cryptographic License Authorization Verification
-# ---------------------------------------------------------------------------
-_ES_HANDSHAKE_PEPPER = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-
-def verify_license_token(token, timestamp, bucket):
-    if not token or not timestamp:
-        return False, "Missing security execution token."
-
-    now_ms = time.time() * 1000
-    try:
-        ts_val = float(timestamp)
-    except (ValueError, TypeError):
-        return False, "Invalid token timestamp."
-
-    if abs(now_ms - ts_val) > 15 * 60 * 1000:
-        return False, "Execution session expired. Please retry synthesis."
-
-    if sys.platform == "darwin":
-        session_file = os.path.expanduser("~/Library/Application Support/EasySpeech/.es_session")
-    else:
-        appdata = os.environ.get("APPDATA") or os.path.expanduser("~\\AppData\\Roaming")
-        session_file = os.path.join(appdata, "EasySpeech", ".es_session")
-
-    if not os.path.exists(session_file):
-        return False, "Active license session not found. Please activate Easy Speech."
-
-    try:
-        with open(session_file, "r", encoding="utf-8") as sf:
-            lines = [l.strip() for l in sf if l.strip()]
-        if len(lines) < 3:
-            return False, "Corrupted license session file."
-
-        key_hex, hwid, verification_sig = lines[0], lines[1], lines[2]
-
-        expected_sig = hmac.new(
-            bytes.fromhex(_ES_HANDSHAKE_PEPPER),
-            f"{key_hex}:{hwid}".encode("utf-8"),
-            hashlib.sha256
-        ).hexdigest()
-
-        fallback_sig = hmac.new(
-            bytes.fromhex(_ES_HANDSHAKE_PEPPER),
-            f"{key_hex}:".encode("utf-8"),
-            hashlib.sha256
-        ).hexdigest()
-
-        if verification_sig != expected_sig and verification_sig != fallback_sig:
-            return False, "License session tampering detected."
-
-        session_key = bytes.fromhex(key_hex)
-        try:
-            target_bucket = int(bucket) if bucket is not None else int(ts_val / (1000 * 60 * 15))
-        except (ValueError, TypeError):
-            target_bucket = int(ts_val / (1000 * 60 * 15))
-
-        valid = False
-        for b in [target_bucket, target_bucket - 1, target_bucket + 1]:
-            data = f"{hwid}:{b}:Easy Speech".encode("utf-8")
-            expected_token = hmac.new(session_key, data, hashlib.sha256).hexdigest()
-            if hmac.compare_digest(str(token), expected_token):
-                valid = True
-                break
-
-        if not valid:
-            return False, "Cryptographic authorization token mismatch."
-
-        return True, ""
-    except Exception as e:
-        return False, f"Token verification error: {str(e)}"
 
 _f5_instance = None
 _whisper_instance = None
@@ -494,6 +438,32 @@ def get_f5_model():
             print("[+] F5-TTS model initialized and warmed up!")
         return _f5_instance
 
+_is_warming_up = False
+
+def warmup_model_async():
+    """Proactively warms up F5-TTS model in a non-blocking background thread."""
+    global _is_warming_up
+    with MODEL_LOCK:
+        if _f5_instance is not None or _is_warming_up:
+            return
+        _is_warming_up = True
+
+    def _worker():
+        global _is_warming_up
+        try:
+            init_environment()
+            print("[*] Proactively warming up AI Model (F5-TTS) in background...", flush=True)
+            get_f5_model()
+            print("[+] AI Model warmup finished successfully!", flush=True)
+        except Exception as e:
+            print(f"[!] AI Model warmup error: {e}", flush=True)
+        finally:
+            with MODEL_LOCK:
+                _is_warming_up = False
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+
 def get_whisper_model():
     global _whisper_instance
     init_environment()
@@ -585,7 +555,10 @@ class VoiceCloneRequestHandler(BaseHTTPRequestHandler):
         global LAST_HEARTBEAT_TIME
         LAST_HEARTBEAT_TIME = time.time()
 
-        if self.path in ["/", "/health", "/api/status", "/api/ping", "/ping"]:
+        raw_path = self.path
+        clean_path = raw_path.split("?")[0].rstrip("/")
+
+        if raw_path in ["/", "/health", "/api/status", "/api/ping", "/ping"] or clean_path in ["", "/health", "/api/status", "/api/ping", "/ping"]:
             gpu = get_gpu_info(allow_block=False)
             uptime = round(time.time() - START_TIME, 1)
             idle = round(time.time() - LAST_HEARTBEAT_TIME, 1)
@@ -598,7 +571,16 @@ class VoiceCloneRequestHandler(BaseHTTPRequestHandler):
                 "idle_seconds": idle,
                 "seconds_since_synthesis": since_synth,
                 "model_loaded": _f5_instance is not None,
+                "is_warming_up": _is_warming_up,
                 "gpu": gpu
+            })
+        elif clean_path in ["/api/warmup", "/warmup"]:
+            warmup_model_async()
+            self._send_json_response(200, {
+                "success": True,
+                "message": "AI Model warmup initiated.",
+                "model_loaded": _f5_instance is not None,
+                "is_warming_up": _is_warming_up
             })
         else:
             self._send_json_response(404, {"error": "Not Found"})
@@ -618,11 +600,22 @@ class VoiceCloneRequestHandler(BaseHTTPRequestHandler):
                 self._send_json_response(400, {"success": False, "error": f"Invalid JSON body: {str(e)}"})
                 return
 
-        path = self.path.rstrip("/")
+        path = self.path.split("?")[0].rstrip("/")
 
         # 0. Heartbeat / Ping Endpoint
         if path in ["/api/ping", "/ping"]:
             self._send_json_response(200, {"success": True, "pong": True, "time": time.time()})
+            return
+
+        # 0b. Proactive AI Model Warmup Endpoint
+        if path in ["/api/warmup", "/warmup"]:
+            warmup_model_async()
+            self._send_json_response(200, {
+                "success": True,
+                "message": "AI Model warmup initiated.",
+                "model_loaded": _f5_instance is not None,
+                "is_warming_up": _is_warming_up
+            })
             return
 
         # 1. Audio Conversion Endpoint
@@ -646,6 +639,12 @@ class VoiceCloneRequestHandler(BaseHTTPRequestHandler):
             audio_path = data.get("audio_path")
             if not audio_path or not os.path.exists(audio_path):
                 self._send_json_response(400, {"success": False, "error": f"Audio file not found: {audio_path}"})
+            ok, current_op = try_acquire_operation("transcribe")
+            if not ok:
+                self._send_json_response(409, {
+                    "success": False,
+                    "error": f"AI model is currently busy with audio {current_op}. Please wait a moment."
+                })
                 return
 
             start_active_task()
@@ -728,18 +727,11 @@ class VoiceCloneRequestHandler(BaseHTTPRequestHandler):
                     "traceback": traceback.format_exc()
                 })
             finally:
+                release_operation("transcribe")
                 finish_active_task()
 
         # 3. High-Speed Synthesis Endpoint (Protected by MODEL_LOCK with OOM Recovery)
         elif path == "/api/generate":
-            token = data.get("token")
-            timestamp = data.get("timestamp")
-            bucket = data.get("bucket")
-            is_valid, auth_err = verify_license_token(token, timestamp, bucket)
-            if not is_valid:
-                self._send_json_response(401, {"success": False, "error": f"Unauthorized: {auth_err}"})
-                return
-
             text = (data.get("text") or "").strip()
             ref_audio = data.get("ref_audio")
             ref_text = (data.get("ref_text") or "").strip()
@@ -753,6 +745,12 @@ class VoiceCloneRequestHandler(BaseHTTPRequestHandler):
                 return
             if not ref_audio or not os.path.exists(ref_audio):
                 self._send_json_response(400, {"success": False, "error": f"Reference audio not found: {ref_audio}"})
+            ok, current_op = try_acquire_operation("generate")
+            if not ok:
+                self._send_json_response(409, {
+                    "success": False,
+                    "error": f"AI model is currently busy with audio {current_op}. Please wait a moment."
+                })
                 return
 
             start_active_task()
@@ -840,6 +838,7 @@ class VoiceCloneRequestHandler(BaseHTTPRequestHandler):
                                 cfg_strength=cfg_strength
                             )
                     except Exception as infer_err:
+                        err_str = str(infer_err).lower()
                         is_oom = "out of memory" in err_str or "cuda error: out of memory" in err_str or "mps backend out of memory" in err_str or isinstance(infer_err, MemoryError)
                         if is_oom or (hasattr(torch.cuda, "OutOfMemoryError") and isinstance(infer_err, torch.cuda.OutOfMemoryError)):
                             try:
@@ -859,6 +858,12 @@ class VoiceCloneRequestHandler(BaseHTTPRequestHandler):
 
                 if samples is None or len(samples) == 0:
                     raise RuntimeError("Voice cloning returned empty audio samples.")
+
+                # Studio Peak Normalization: prevent digital clipping/distortion when saving to PCM WAV
+                import numpy as np
+                max_amp = float(np.max(np.abs(samples)))
+                if max_amp > 0.95:
+                    samples = samples * (0.95 / max_amp)
 
                 sf.write(output_path, samples, sample_rate)
                 duration = float(len(samples)) / float(sample_rate)
@@ -891,6 +896,7 @@ class VoiceCloneRequestHandler(BaseHTTPRequestHandler):
                     "traceback": traceback.format_exc()
                 })
             finally:
+                release_operation("generate")
                 finish_active_task()
 
         # 4. Unload / VRAM Cleanup Endpoint
