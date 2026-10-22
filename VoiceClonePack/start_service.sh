@@ -14,7 +14,7 @@ unset PYTHONHOME
 unset PYTHONUSERSITE
 
 PYTHON_EXE=""
-for cand in "$DIR/.venv/bin/python" "$DIR/.venv/bin/python3" "$DIR/.python311/bin/python3" "$HOME/.easyspeech/python311/bin/python3" "$HOME/.easyspeech/venv/bin/python3"; do
+for cand in "$DIR/.venv/bin/python" "$DIR/.venv/bin/python3" "$HOME/.easyspeech/venv/bin/python" "$HOME/.easyspeech/venv/bin/python3" "$DIR/.python311/bin/python3" "$HOME/.easyspeech/python311/bin/python3"; do
     if [ -n "$cand" ] && [ -x "$cand" ]; then
         if "$cand" -c "import sys; sys.exit(0 if sys.version_info[:2] == (3, 11) else 1)" >/dev/null 2>&1; then
             PYTHON_EXE="$cand"

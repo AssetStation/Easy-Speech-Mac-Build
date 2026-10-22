@@ -566,7 +566,7 @@ class VoiceCloneRequestHandler(BaseHTTPRequestHandler):
             self._send_json_response(200, {
                 "status": "online",
                 "service": "Easy Speech Voice Clone Expansion Pack",
-                "version": "1.0.0",
+                "version": "1.1.0",
                 "uptime_seconds": uptime,
                 "idle_seconds": idle,
                 "seconds_since_synthesis": since_synth,

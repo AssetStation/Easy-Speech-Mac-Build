@@ -26,10 +26,18 @@ echo ""
 rm -f "$DIR/.installed_success" 2>/dev/null
 
 # Fast Check: If existing environment is already 100% healthy, avoid re-downloading!
-if [ -f "$DIR/.venv/bin/python" ]; then
+HEALTHY_PY=""
+for cand_py in "$DIR/.venv/bin/python" "$HOME/.easyspeech/venv/bin/python"; do
+    if [ -f "$cand_py" ]; then
+        HEALTHY_PY="$cand_py"
+        break
+    fi
+done
+
+if [ -n "$HEALTHY_PY" ]; then
     echo "[PROGRESS:15] Checking existing AI environment integrity..."
     echo "[*] Checking health of existing Voice Clone installation..."
-    if "$DIR/.venv/bin/python" -c "import sys, torch, f5_tts, faster_whisper; assert sys.version_info[:2] == (3, 11), 'Python 3.11 required'" >/dev/null 2>&1; then
+    if "$HEALTHY_PY" -c "import sys, torch, f5_tts, faster_whisper; assert sys.version_info[:2] == (3, 11), 'Python 3.11 required'" >/dev/null 2>&1; then
         echo "[HEALTH_CHECK:PASSED]"
         echo "[PROGRESS:100] All AI packages are healthy and verified!"
         echo "[✓] Fast Health Check Passed: All AI packages are already installed and 100% functional!"
@@ -84,7 +92,7 @@ echo ""
 # -----------------------------------------------------------------------
 echo "[PROGRESS:7] Checking free disk space..."
 echo "[*] Checking available storage on drive..."
-FREE_KB=$(df -k "$DIR" | awk 'NR==2 {print $4}')
+FREE_KB=$(df -k -P "$DIR" | awk 'NR==2 {print $4}')
 if [ -n "$FREE_KB" ] && [ "$FREE_KB" -lt 8388608 ]; then
     echo "[!] ERROR: Insufficient disk space."
     echo "    Voice Clone Pack requires at least 8 GB of free disk space for AI neural engines."
@@ -180,6 +188,8 @@ if [ -z "$PYTHON_EXE" ]; then
         echo "[*] Extracting portable runtime into $INSTALL_TARGET (zero internet download required)..."
         rm -rf "$INSTALL_TARGET"/* 2>/dev/null
         tar -xzf "$LOCAL_TAR" -C "$INSTALL_TARGET" --strip-components 1
+        chmod -R +x "$INSTALL_TARGET/bin" 2>/dev/null || true
+        xattr -cr "$INSTALL_TARGET" 2>/dev/null || true
         if [ -x "$INSTALL_TARGET/bin/python3" ]; then
             if "$INSTALL_TARGET/bin/python3" -c "import sys; sys.exit(0 if sys.version_info[:2] == (3, 11) else 1)" >/dev/null 2>&1; then
                 PYTHON_EXE="$INSTALL_TARGET/bin/python3"
@@ -201,6 +211,8 @@ if [ -z "$PYTHON_EXE" ]; then
             rm -rf "$INSTALL_TARGET"/* 2>/dev/null
             tar -xzf "$TMP_TAR" -C "$INSTALL_TARGET" --strip-components 1
             rm -f "$TMP_TAR"
+            chmod -R +x "$INSTALL_TARGET/bin" 2>/dev/null || true
+            xattr -cr "$INSTALL_TARGET" 2>/dev/null || true
             if [ -x "$INSTALL_TARGET/bin/python3" ]; then
                 if "$INSTALL_TARGET/bin/python3" -c "import sys; sys.exit(0 if sys.version_info[:2] == (3, 11) else 1)" >/dev/null 2>&1; then
                     PYTHON_EXE="$INSTALL_TARGET/bin/python3"
@@ -258,13 +270,20 @@ echo ""
 # -----------------------------------------------------------------------
 echo "[PROGRESS:65] Creating isolated AI environment (.venv)..."
 echo "[*] Step 4/4: Setting up isolated AI environment (.venv)..."
-if [ ! -f "$DIR/.venv/bin/python" ]; then
-    if [ -d "$DIR/.venv" ]; then
+
+VENV_DIR="$DIR/.venv"
+if [ ! -w "$DIR" ]; then
+    VENV_DIR="$HOME/.easyspeech/venv"
+    mkdir -p "$VENV_DIR" 2>/dev/null
+fi
+
+if [ ! -f "$VENV_DIR/bin/python" ]; then
+    if [ -d "$VENV_DIR" ]; then
         echo "[*] Cleaning incomplete virtual environment..."
-        rm -rf "$DIR/.venv" 2>/dev/null
+        rm -rf "$VENV_DIR" 2>/dev/null
     fi
-    echo "[*] Creating virtual environment at .venv ..."
-    "$PYTHON_EXE" -m venv --clear "$DIR/.venv"
+    echo "[*] Creating virtual environment at $VENV_DIR ..."
+    "$PYTHON_EXE" -m venv --clear "$VENV_DIR"
     if [ $? -ne 0 ]; then
         echo "[!] Failed to create virtual environment."
         if [ "$NO_PAUSE" != "1" ]; then
@@ -272,46 +291,69 @@ if [ ! -f "$DIR/.venv/bin/python" ]; then
         fi
         exit 1
     fi
+    chmod -R +x "$VENV_DIR/bin" 2>/dev/null || true
+    xattr -cr "$VENV_DIR" 2>/dev/null || true
     echo "[✓] Virtual environment created."
 else
-    echo "[✓] Existing virtual environment detected at .venv."
+    chmod -R +x "$VENV_DIR/bin" 2>/dev/null || true
+    xattr -cr "$VENV_DIR" 2>/dev/null || true
+    echo "[✓] Existing virtual environment detected."
 fi
 
-VENV_PY="$DIR/.venv/bin/python"
+VENV_PY="$VENV_DIR/bin/python"
 
 echo ""
 echo "[*] Upgrading pip, setuptools, and wheel..."
 "$VENV_PY" -m pip install --upgrade pip setuptools wheel --retries 10 --timeout 60 2>/dev/null || true
 
 echo ""
-echo "[PROGRESS:75] Installing PyTorch with Metal acceleration (takes ~10-15 mins)..."
-echo "[*] Installing PyTorch with Metal MPS acceleration..."
-echo "    (This package is ~2 GB and typically takes 10-15 minutes depending on your internet speed)"
-"$VENV_PY" -m pip install torch torchvision torchaudio --retries 10 --timeout 60
-if [ $? -ne 0 ]; then
-    echo "[!] ERROR: Failed to install PyTorch. Network connection may have dropped."
-    if [ "$NO_PAUSE" != "1" ]; then
-        read -p "Press Enter to exit..."
+PYTORCH_ATTEMPTS=0
+while [ $PYTORCH_ATTEMPTS -lt 3 ]; do
+    PYTORCH_ATTEMPTS=$((PYTORCH_ATTEMPTS + 1))
+    echo "[PROGRESS:75] Installing PyTorch with Metal acceleration (takes ~10-15 mins)..."
+    echo "[*] Installing PyTorch with Metal MPS acceleration (attempt $PYTORCH_ATTEMPTS of 3)..."
+    echo "    (This package is ~2 GB and typically takes 10-15 minutes depending on your internet speed)"
+    if "$VENV_PY" -m pip install torch torchvision torchaudio --no-compile --retries 15 --timeout 180; then
+        break
     fi
-    exit 1
-fi
+    if [ $PYTORCH_ATTEMPTS -lt 3 ]; then
+        echo "[!] Connection momentarily dropped. Resuming download in 5 seconds..."
+        sleep 5
+    else
+        echo "[!] ERROR: Failed to install PyTorch after multiple attempts. Network connection may have dropped."
+        if [ "$NO_PAUSE" != "1" ]; then
+            read -p "Press Enter to exit..."
+        fi
+        exit 2
+    fi
+done
 
 echo ""
-echo "[PROGRESS:88] Installing F5-TTS Neural Diffusion and Whisper..."
-echo "[*] Installing F5-TTS, Faster-Whisper, soundfile, and audio libraries..."
-"$VENV_PY" -m pip install f5-tts faster-whisper soundfile imageio_ffmpeg pydub --retries 10 --timeout 60
-if [ $? -ne 0 ]; then
-    echo "[!] ERROR: Failed to install F5-TTS dependencies. Download interrupted."
-    if [ "$NO_PAUSE" != "1" ]; then
-        read -p "Press Enter to exit..."
+F5_ATTEMPTS=0
+while [ $F5_ATTEMPTS -lt 3 ]; do
+    F5_ATTEMPTS=$((F5_ATTEMPTS + 1))
+    echo "[PROGRESS:88] Installing F5-TTS Neural Diffusion and Whisper..."
+    echo "[*] Installing F5-TTS, Faster-Whisper, soundfile, and audio libraries (attempt $F5_ATTEMPTS of 3)..."
+    if "$VENV_PY" -m pip install f5-tts faster-whisper soundfile imageio_ffmpeg pydub --no-compile --retries 15 --timeout 180; then
+        break
     fi
-    exit 1
-fi
+    if [ $F5_ATTEMPTS -lt 3 ]; then
+        echo "[!] Connection momentarily dropped. Resuming download in 5 seconds..."
+        sleep 5
+    else
+        echo "[!] ERROR: Failed to install F5-TTS dependencies after multiple attempts. Download interrupted."
+        if [ "$NO_PAUSE" != "1" ]; then
+            read -p "Press Enter to exit..."
+        fi
+        exit 2
+    fi
+done
 
 echo ""
 echo "[PROGRESS:95] Verifying AI runtime engine..."
 echo "[*] Verifying all installed AI packages and portable FFmpeg..."
-find "$DIR/.venv" -name "ffmpeg*" -type f -exec chmod +x {} + 2>/dev/null || true
+find "$VENV_DIR" -name "ffmpeg*" -type f -exec chmod +x {} + 2>/dev/null || true
+find "$VENV_DIR" -name "ffmpeg*" -type f -exec xattr -cr {} + 2>/dev/null || true
 "$VENV_PY" -c "import torch, f5_tts, faster_whisper, imageio_ffmpeg; print('[✓] AI packages verified. FFmpeg binary:', imageio_ffmpeg.get_ffmpeg_exe())"
 if [ $? -ne 0 ]; then
     echo "[!] ERROR: Package verification failed. One or more packages are incomplete."
