@@ -19,7 +19,7 @@ if IS_MAC:
     ENGINE_DIR = os.path.join(ROOT_DIR, "bin", "mac", f"engine_{mac_arch}")
     BIN_NAME = "engine"
 elif IS_WIN:
-    ENGINE_DIR = os.path.join(ROOT_DIR, "bin", "win", "engine")
+    ENGINE_DIR = os.path.join(ROOT_DIR, "bin", "engine")
     BIN_NAME = "engine.exe"
 else:
     ENGINE_DIR = os.path.join(ROOT_DIR, "bin", "linux", "engine")
@@ -41,7 +41,7 @@ def clean_temp_dirs():
 
 def build_standalone():
     print("=" * 60)
-    print("Easy Speech - Standalone Engine Compiler")
+    print("Easy Speech Pro - Standalone Engine Compiler")
     print(f"Target OS: {'macOS' if IS_MAC else ('Windows' if IS_WIN else 'Linux')}")
     if IS_MAC:
         print(f"Architecture: {platform.machine()} -> {mac_arch}")
@@ -65,14 +65,31 @@ def build_standalone():
         "--collect-all", "piper",
         "--collect-all", "soundfile",
         "--collect-all", "onnxruntime",
+        "--collect-all", "cryptography",
         "--copy-metadata", "kokoro-onnx",
         "--copy-metadata", "piper-tts",
+        "--copy-metadata", "cryptography",
         "--hidden-import", "kokoro_onnx",
         "--hidden-import", "piper",
         "--hidden-import", "soundfile",
         "--hidden-import", "numpy",
-        SCRIPT_PATH
+        "--hidden-import", "cryptography",
+        "--exclude-module", "torch",
+        "--exclude-module", "torchvision",
+        "--exclude-module", "torchaudio",
+        "--exclude-module", "matplotlib",
+        "--exclude-module", "llvmlite",
+        "--exclude-module", "numba",
+        "--exclude-module", "PIL",
+        "--exclude-module", "Cython",
+        "--exclude-module", "sympy",
     ]
+
+    version_file = os.path.join(ROOT_DIR, "backend", "file_version_info.txt")
+    if IS_WIN and os.path.exists(version_file):
+        cmd.extend(["--version-file", version_file])
+
+    cmd.append(SCRIPT_PATH)
 
     print(f"[*] Running PyInstaller compilation...")
     res = subprocess.run(cmd)
@@ -120,7 +137,7 @@ def build_standalone():
     clean_temp_dirs()
 
     print("\n" + "=" * 60)
-    print(f"[✓] Successfully built Easy Speech standalone engine at:\n    {ENGINE_DIR}")
+    print(f"[✓] Successfully built Easy Speech Pro standalone engine at:\n    {ENGINE_DIR}")
     print("=" * 60)
 
 if __name__ == "__main__":
