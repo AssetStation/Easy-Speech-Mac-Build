@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Easy Speech - 1-Click Voice Clone Installer for macOS
+# Easy Speech Pro - 1-Click Voice Clone Installer for macOS
 # Double-clickable in Finder (Zero terminal typing required)
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

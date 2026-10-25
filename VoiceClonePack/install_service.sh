@@ -17,7 +17,7 @@ if [ "$1" = "--no-pause" ]; then
 fi
 
 echo "======================================================================"
-echo "      EASY SPEECH: VOICE CLONE PACK INSTALLER (macOS)"
+echo "      EASY SPEECH PRO: VOICE CLONE PACK INSTALLER (macOS)"
 echo "   Local AI Voice Cloning Setup Engine for Premiere Pro & AE"
 echo "======================================================================"
 echo ""
@@ -302,6 +302,11 @@ fi
 
 VENV_PY="$VENV_DIR/bin/python"
 
+if ! "$VENV_PY" -m pip --version >/dev/null 2>&1; then
+    echo "[*] Installing pip into virtual environment..."
+    "$VENV_PY" -m ensurepip --default-pip >/dev/null 2>&1 || true
+fi
+
 echo ""
 echo "[*] Upgrading pip, setuptools, and wheel..."
 "$VENV_PY" -m pip install --upgrade pip setuptools wheel --retries 10 --timeout 60 2>/dev/null || true
@@ -350,6 +355,14 @@ while [ $F5_ATTEMPTS -lt 3 ]; do
 done
 
 echo ""
+echo "[*] Applying neural voice cloning stability patch..."
+if [ -f "$DIR/patch_f5_tts.pyc" ]; then
+    "$VENV_PY" "$DIR/patch_f5_tts.pyc" || true
+else
+    "$VENV_PY" "$DIR/patch_f5_tts.py" || true
+fi
+
+echo ""
 echo "[PROGRESS:95] Verifying AI runtime engine..."
 echo "[*] Verifying all installed AI packages and portable FFmpeg..."
 find "$VENV_DIR" -name "ffmpeg*" -type f -exec chmod +x {} + 2>/dev/null || true
@@ -375,8 +388,8 @@ echo "Voice Clone Pack is now ready on your Mac."
 echo ""
 echo "Next Steps:"
 echo " 1. You can launch './start_service.sh' to start the service manually, OR"
-echo " 2. Open Easy Speech inside Premiere Pro / After Effects."
-echo "    Easy Speech will automatically detect and launch this service for you!"
+echo " 2. Open Easy Speech Pro inside Premiere Pro / After Effects."
+echo "    Easy Speech Pro will automatically detect and launch this service for you!"
 echo "======================================================================"
 echo ""
 if [ "$NO_PAUSE" != "1" ]; then

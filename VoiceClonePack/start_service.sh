@@ -6,7 +6,7 @@ export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin
 export PYTORCH_ENABLE_MPS_FALLBACK=1
 
 echo "========================================================"
-echo "  EASY SPEECH: VOICE CLONE EXPANSION SERVICE (macOS)"
+echo "  EASY SPEECH PRO: VOICE CLONE EXPANSION SERVICE (macOS)"
 echo "========================================================"
 
 unset PYTHONPATH
