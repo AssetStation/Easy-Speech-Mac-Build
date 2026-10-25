@@ -23,7 +23,7 @@ permissions:
 jobs:
   build-mac-arm64:
     name: macOS Apple Silicon (M1/M2/M3/M4) Engine
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
