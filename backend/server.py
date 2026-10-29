@@ -51,9 +51,7 @@ else:
         except Exception: pass
 
 import time
-import uuid
-import hmac
-import hashlib
+import re
 import numpy as np
 import soundfile as sf
 
@@ -83,7 +81,6 @@ except Exception:
 
 # Global model instances
 kokoro_instance = None
-piper_voices = {}
 f5_instance = None
 
 # Ensure portable ffmpeg in PATH for audio conversion if available
@@ -141,324 +138,28 @@ def get_kokoro():
         kokoro_instance = Kokoro(model_path, voices_path)
     return kokoro_instance
 
-def get_piper_voice(model_name="en_US-lessac-medium"):
-    global piper_voices
-    if model_name not in piper_voices:
-        from piper import PiperVoice
-        model_path = os.path.join(MODELS_DIR, f"{model_name}.onnx")
-        config_path = os.path.join(MODELS_DIR, f"{model_name}.onnx.json")
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"Piper model {model_name} not found in models/ folder.")
-        piper_voices[model_name] = PiperVoice.load(model_path, config_path=config_path)
-    return piper_voices[model_name]
-
-# ===========================================================================
-# 🛡️ CRYPTOGRAPHIC RUNTIME SECURITY & ENTANGLEMENT ENGINE
-# ===========================================================================
-PUBLIC_KEY_PEM = """-----BEGIN PUBLIC KEY-----
-MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEFXqgmcQCRgBFT0fyOYPlztPAYvpU
-cXpHytneusbAk74qfrmdBIA8UZXb2bKO1yiE7ce5kF2UJk9ErPqzbRHYxQ==
------END PUBLIC KEY-----"""
-
-def get_system_machine_guid():
-    import platform
-    import subprocess
-    try:
-        if platform.system() == 'Windows':
-            out = subprocess.check_output(['reg', 'query', r'HKLM\SOFTWARE\Microsoft\Cryptography', '/v', 'MachineGuid'], stderr=subprocess.DEVNULL)
-            for line in out.decode().splitlines():
-                if 'MachineGuid' in line:
-                    parts = line.strip().split()
-                    return parts[-1].strip()
-        elif platform.system() == 'Darwin':
-            out = subprocess.check_output(['/usr/sbin/ioreg', '-rd1', '-c', 'IOPlatformExpertDevice'], stderr=subprocess.DEVNULL)
-            for line in out.decode().splitlines():
-                if 'IOPlatformUUID' in line:
-                    parts = line.split('=')
-                    if len(parts) > 1:
-                        return "".join(c for c in parts[1].strip().strip('"') if c.isalnum())
-    except Exception:
-        pass
-    return ""
-
-def unseal_device_identity():
-    import platform
-    import hashlib
-    import json
-    if platform.system() == 'Darwin':
-        path = os.path.expanduser('~/Library/Application Support/EasySpeech/.device_identity')
-    else:
-        appdata = os.environ.get('APPDATA') or os.path.expanduser('~')
-        path = os.path.join(appdata, 'EasySpeech', '.device_identity')
-    if not os.path.exists(path):
-        return ""
-    try:
-        with open(path, 'r', encoding='utf-8') as f:
-            raw = json.load(f)
-        guid = get_system_machine_guid()
-        if not guid or 'data' not in raw or 'iv' not in raw or 'tag' not in raw:
-            return ""
-        key = hashlib.pbkdf2_hmac('sha256', guid.encode('utf-8'), b'ES_CACHE_SALT_#8492_PRO', 2000, 32)
-        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-        aesgcm = AESGCM(key)
-        ciphertext = bytes.fromhex(raw['data']) + bytes.fromhex(raw['tag'])
-        iv = bytes.fromhex(raw['iv'])
-        plaintext = aesgcm.decrypt(iv, ciphertext, None)
-        return plaintext.decode('utf-8').strip()
-    except Exception:
-        return ""
-
-def get_hardware_id():
-    import platform
-    import subprocess
-    try:
-        if platform.system() == 'Windows':
-            out = subprocess.check_output(['powershell', '-NoProfile', '-Command', '(Get-CimInstance Win32_BaseBoard).SerialNumber'], stderr=subprocess.DEVNULL)
-            hwid = "".join(c for c in out.decode().strip() if c.isalnum())
-            is_zeroes = all(c == '0' for c in hwid) if hwid else False
-            is_placeholder = any(hwid.lower().startswith(p) for p in ['none', 'default', 'tobedefined', 'tobefilled', 'baseboard', 'unknown']) if hwid else False
-            is_generic = not hwid or len(hwid) < 3 or is_zeroes or is_placeholder
-            if is_generic:
-                guid = get_system_machine_guid()
-                if guid and len(guid) >= 4:
-                    hwid = guid
-                else:
-                    try:
-                        cpu_disk = subprocess.check_output(['powershell', '-NoProfile', '-Command', '(Get-CimInstance Win32_Processor).ProcessorId; (Get-CimInstance Win32_DiskDrive | Select-Object -First 1).SerialNumber'], stderr=subprocess.DEVNULL)
-                        lines = ["".join(c for c in l if c.isalnum()) for l in cpu_disk.decode().splitlines() if l.strip()]
-                        if lines:
-                            hwid = hashlib.sha256(":".join(lines).encode('utf-8')).hexdigest()[:32].upper()
-                    except Exception:
-                        pass
-            if not hwid or len(hwid) < 4:
-                unsealed = unseal_device_identity()
-                if unsealed and len(unsealed) >= 4:
-                    hwid = unsealed
-                else:
-                    hwid = 'WIN_' + (os.environ.get('COMPUTERNAME') or 'DEVICE')
-            return hwid
-        else:
-            out = subprocess.check_output(['/usr/sbin/ioreg', '-rd1', '-c', 'IOPlatformExpertDevice'], stderr=subprocess.DEVNULL)
-            hwid = ""
-            for line in out.decode().splitlines():
-                if 'IOPlatformUUID' in line:
-                    parts = line.split('=')
-                    if len(parts) > 1:
-                        hwid = "".join(c for c in parts[1].strip().strip('"') if c.isalnum())
-                        break
-            if not hwid or len(hwid) < 4:
-                unsealed = unseal_device_identity()
-                if unsealed and len(unsealed) >= 4:
-                    hwid = unsealed
-                else:
-                    hwid = 'MAC_' + (os.environ.get('USER') or 'DEVICE')
-            return hwid
-    except Exception:
-        unsealed = unseal_device_identity()
-        if unsealed and len(unsealed) >= 4:
-            return unsealed
-        return 'UNKNOWN_DEVICE'
-
-def load_license_cache(hwid):
-    import platform
-    import json
-    if platform.system() == 'Darwin':
-        path = os.path.expanduser('~/Library/Application Support/EasySpeech/license_cache.json')
-    else:
-        appdata = os.environ.get('APPDATA') or os.path.expanduser('~')
-        path = os.path.join(appdata, 'EasySpeech', 'license_cache.json')
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path, 'r', encoding='utf-8') as f:
-            raw = f.read().strip()
-        if not raw:
-            return None
-        if raw.startswith('{'):
-            try:
-                parsed_env = json.loads(raw)
-                if 'iv' in parsed_env and 'tag' in parsed_env and 'data' in parsed_env:
-                    key = hashlib.pbkdf2_hmac('sha256', hwid.encode('utf-8'), b'ES_CACHE_SALT_#8492_PRO', 10000, 32)
-                    try:
-                        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-                        aesgcm = AESGCM(key)
-                        ciphertext = bytes.fromhex(parsed_env['data']) + bytes.fromhex(parsed_env['tag'])
-                        iv = bytes.fromhex(parsed_env['iv'])
-                        plaintext = aesgcm.decrypt(iv, ciphertext, None)
-                        return json.loads(plaintext.decode('utf-8'))
-                    except Exception:
-                        return None
-            except Exception:
-                pass
-        # Legacy XOR
-        text = ""
-        for i in range(0, len(raw), 2):
-            char_code = int(raw[i:i+2], 16) ^ ord(hwid[(i // 2) % len(hwid)])
-            text += chr(char_code)
-        return json.loads(text)
-    except Exception:
-        return None
-
-def get_os_monotonic_watermark():
-    import platform
-    if platform.system() == 'Windows':
-        try:
-            import winreg
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\EasySpeech")
-            val, _ = winreg.QueryValueEx(key, "LastActiveWatermark")
-            winreg.CloseKey(key)
-            return int(val)
-        except Exception:
-            return 0
-    else:
-        try:
-            wm_path = os.path.expanduser('~/.easyspeech_wm')
-            if os.path.exists(wm_path):
-                with open(wm_path, 'r', encoding='utf-8') as f:
-                    return int(f.read().strip())
-        except Exception:
-            return 0
-    return 0
-
-def verify_execution_session(token=None, timestamp=None, bucket=None, handshake_json=None):
-    import json
-    if handshake_json:
-        try:
-            if os.path.exists(handshake_json):
-                with open(handshake_json, 'r', encoding='utf-8') as hf:
-                    data = json.load(hf)
-            else:
-                data = json.loads(handshake_json)
-            if isinstance(data, dict):
-                token = token or data.get("token")
-                timestamp = timestamp or data.get("timestamp")
-                bucket = bucket if bucket is not None else data.get("bucket")
-        except Exception:
-            pass
-
-    if not token or not timestamp:
-        return {"valid": False, "error": "Please activate a valid Easy Speech Pro license to synthesize speech."}
-
-    now_ms = time.time() * 1000
-    if abs(now_ms - timestamp) > 15 * 60 * 1000:
-        return {"valid": False, "error": "Session timed out. Please click Generate Voiceover again."}
-
-    hwid = get_hardware_id()
-    cache = load_license_cache(hwid)
-    if not cache:
-        return {"valid": False, "error": "Please activate a valid Easy Speech Pro license."}
-
-    signed_payload_str = cache.get("signed_payload")
-    signature_hex = cache.get("signature")
-    if not signed_payload_str or not signature_hex:
-        return {"valid": False, "error": "License verification failed: unauthenticated or corrupted session."}
-
-    try:
-        from cryptography.hazmat.primitives import hashes, serialization
-        from cryptography.hazmat.primitives.asymmetric import ec
-        from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
-
-        pub_key = serialization.load_pem_public_key(PUBLIC_KEY_PEM.encode('utf-8'))
-        sig_bytes = bytes.fromhex(signature_hex)
-        if len(sig_bytes) != 64:
-            return {"valid": False, "error": "License verification failed: invalid signature format."}
-        r = int.from_bytes(sig_bytes[:32], 'big')
-        s = int.from_bytes(sig_bytes[32:], 'big')
-        der_sig = encode_dss_signature(r, s)
-        pub_key.verify(der_sig, signed_payload_str.encode('utf-8'), ec.ECDSA(hashes.SHA256()))
-
-        payload = json.loads(signed_payload_str)
-        if payload.get("product") not in ("Easy Speech Pro", "Easy Speech"):
-            return {"valid": False, "error": "This license is not valid for Easy Speech Pro."}
-        if payload.get("hwid") != hwid:
-            return {"valid": False, "error": "This license is already active on another device."}
-
-        # Validate license expiration against signed payload
-        exp_str = payload.get("exp")
-        if exp_str:
-            try:
-                from datetime import datetime
-                exp_clean = exp_str.replace("Z", "+00:00")
-                exp_dt = datetime.fromisoformat(exp_clean)
-                exp_ts_ms = exp_dt.timestamp() * 1000
-                is_trial = payload.get("type") == "trial"
-                grace_ms = 0 if is_trial else 48 * 3600 * 1000
-                if now_ms > (exp_ts_ms + grace_ms):
-                    return {"valid": False, "error": "License expired. Please renew your Easy Speech Pro license."}
-            except Exception:
-                return {"valid": False, "error": "License verification failed: invalid expiration date."}
-    except Exception:
-        return {"valid": False, "error": "License verification failed: cryptographic signature untrusted or tampered."}
-
-    seed = cache.get("entanglement_seed")
-    if not seed:
-        return {"valid": False, "error": "License session corrupted. Please reactivate your license in settings."}
-
-    current_bucket = int(time.time() // (60 * 15))
-    valid = False
-    candidates = [current_bucket, current_bucket - 1, current_bucket + 1]
-    if bucket is not None and bucket not in candidates:
-        return {"valid": False, "error": "Session token expired. Please retry."}
-
-    for b in candidates:
-        for prod in ("Easy Speech Pro", "Easy Speech"):
-            data = f"{hwid}:{b}:{prod}".encode('utf-8')
-            expected_token = hmac.new(seed.encode('utf-8'), data, hashlib.sha256).hexdigest()
-            if hmac.compare_digest(expected_token, token):
-                valid = True
-                break
-        if valid:
-            break
-
-    if not valid:
-        return {"valid": False, "error": "License verification failed. Please reactivate your license in settings."}
-
-    cache_date = cache.get("cache_date")
-    last_active = cache.get("last_active_timestamp") or cache_date
-    os_watermark = get_os_monotonic_watermark()
-    highest_watermark = max(last_active or 0, os_watermark or 0)
-
-    if cache_date and (cache_date > now_ms + 3600000 or now_ms - cache_date < -3600000):
-        return {"valid": False, "error": "System clock anomaly detected. Please ensure your clock is set correctly."}
-    if highest_watermark > 0 and (highest_watermark - now_ms > 3600000):
-        return {"valid": False, "error": "System clock anomaly detected. Please ensure your clock is set correctly."}
-
-    return {"valid": True}
-
 def run_cli():
     import argparse
     import json
 
-    parser = argparse.ArgumentParser(description="Easy Speech Pro One-Shot Synthesizer")
+    parser = argparse.ArgumentParser(description="Easy Speech Pro Free One-Shot Synthesizer")
     parser.add_argument("--cli", action="store_true", help="Run in CLI one-shot mode")
     parser.add_argument("--text", type=str, default="", help="Text to synthesize")
     parser.add_argument("--text-file", type=str, default=None, help="Path to UTF-8 text file containing script")
     parser.add_argument("--voice", type=str, default="af_heart", help="Voice ID")
-    parser.add_argument("--engine", type=str, default="kokoro", choices=["kokoro", "piper", "f5_clone"], help="TTS engine")
+    parser.add_argument("--engine", type=str, default="kokoro", choices=["kokoro", "f5_clone"], help="TTS engine")
     parser.add_argument("--ref-audio", type=str, default=None, help="Reference audio path for voice cloning")
     parser.add_argument("--ref-text", type=str, default=None, help="Spoken transcript of reference audio (optional)")
     parser.add_argument("--speed", type=float, default=1.0, help="Speaking speed")
     parser.add_argument("--lang", type=str, default="en", help="Language code for synthesis")
     parser.add_argument("--output", type=str, default=None, help="Explicit output wav path")
     parser.add_argument("--result-json", type=str, default=None, help="Path to write JSON metadata")
-    parser.add_argument("--token", type=str, default=None, help="Execution security token")
-    parser.add_argument("--token-ts", type=float, default=None, help="Execution token timestamp")
-    parser.add_argument("--token-bucket", type=int, default=None, help="Execution token bucket")
-    parser.add_argument("--handshake-json", type=str, default=None, help="JSON string or path of security handshake")
+    parser.add_argument("--token", type=str, default=None, help="Deprecated/legacy parameter")
+    parser.add_argument("--token-ts", type=float, default=None, help="Deprecated/legacy parameter")
+    parser.add_argument("--token-bucket", type=int, default=None, help="Deprecated/legacy parameter")
+    parser.add_argument("--handshake-json", type=str, default=None, help="Deprecated/legacy parameter")
 
     args, _ = parser.parse_known_args()
-
-    # Cryptographic license token verification
-    chk = verify_execution_session(args.token, args.token_ts, args.token_bucket, args.handshake_json)
-    if not chk.get("valid"):
-        err_res = {"success": False, "error": chk.get("error", "Unauthorized: Valid Easy Speech Pro license required.")}
-        if args.result_json:
-            try:
-                with open(args.result_json, "w", encoding="utf-8") as f:
-                    json.dump(err_res, f)
-            except Exception: pass
-        print(json.dumps(err_res))
-        sys.exit(1)
 
     text = ""
     if args.text_file and os.path.exists(args.text_file):
@@ -488,7 +189,6 @@ def run_cli():
     else:
         # Default filename format: {model}_{voice}_{input_first_8_char}_{timestamp}.wav
         safe_engine = str(args.engine or "kokoro").lower()
-        import re
         raw_v = str(args.voice or "voice")
         clean_v = re.sub(r'^[a-zA-Z]{2}_', '', raw_v)
         clean_v = re.sub(r'^[a-zA-Z]{2}_[a-zA-Z]{2}-', '', clean_v)
@@ -524,21 +224,6 @@ def run_cli():
                 raise RuntimeError("Kokoro synthesis returned empty audio. Check that text is supported.")
             sf.write(output_filepath, samples, sample_rate)
             duration = float(len(samples)) / float(sample_rate)
-
-        elif args.engine == "piper":
-            from piper.config import SynthesisConfig
-            voice = get_piper_voice(args.voice)
-            length_scale = 1.0 / max(0.2, min(float(args.speed), 3.0))
-            syn_cfg = SynthesisConfig(length_scale=length_scale)
-            chunks = list(voice.synthesize(text, syn_config=syn_cfg))
-            if not chunks:
-                raise RuntimeError("Piper synthesis returned no audio.")
-            all_audio = np.concatenate([c.audio_float_array for c in chunks])
-            if len(all_audio) == 0:
-                raise RuntimeError("Piper produced empty audio array.")
-            sample_rate = chunks[0].sample_rate
-            sf.write(output_filepath, all_audio, sample_rate)
-            duration = float(len(all_audio)) / float(sample_rate)
 
         elif args.engine == "f5_clone":
             ref_audio = args.ref_audio
