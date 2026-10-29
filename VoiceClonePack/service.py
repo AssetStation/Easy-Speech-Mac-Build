@@ -1898,79 +1898,8 @@ class VoiceCloneRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-ES-Token, X-ES-Token-Ts, X-ES-Token-Bucket")
 
     def _verify_client_authorized(self, data):
-        """Verifies that the request is authorized by a valid cryptographic execution token or on-disk license."""
-        token = self.headers.get("X-ES-Token") or (data.get("token") if isinstance(data, dict) else None)
-        timestamp = self.headers.get("X-ES-Token-Ts") or (data.get("timestamp") if isinstance(data, dict) else None)
-        bucket = self.headers.get("X-ES-Token-Bucket") or (data.get("bucket") if isinstance(data, dict) else None)
-
-        try:
-            if timestamp is not None:
-                timestamp = float(timestamp)
-        except Exception:
-            timestamp = None
-        try:
-            if bucket is not None:
-                bucket = int(bucket)
-        except Exception:
-            bucket = None
-
-        try:
-            backend_path = os.path.join(EXT_ROOT, "backend")
-            if backend_path not in sys.path:
-                sys.path.insert(0, backend_path)
-            from server import verify_execution_session, get_hardware_id, load_license_cache, PUBLIC_KEY_PEM
-
-            if token and timestamp is not None:
-                chk = verify_execution_session(token=token, timestamp=timestamp, bucket=bucket)
-                if chk.get("valid"):
-                    return True, None
-                return False, chk.get("error", "Unauthorized: Invalid execution token.")
-
-            # Fallback to local on-disk license verification
-            hwid = get_hardware_id()
-            cache = load_license_cache(hwid)
-            if not cache:
-                return False, "Please activate a valid Easy Speech Pro license."
-
-            signed_payload_str = cache.get("signed_payload")
-            signature_hex = cache.get("signature")
-            if not signed_payload_str or not signature_hex:
-                return False, "License verification failed: unauthenticated or corrupted session."
-
-            from cryptography.hazmat.primitives import hashes, serialization
-            from cryptography.hazmat.primitives.asymmetric import ec
-            from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
-
-            pub_key = serialization.load_pem_public_key(PUBLIC_KEY_PEM.encode('utf-8'))
-            sig_bytes = bytes.fromhex(signature_hex)
-            if len(sig_bytes) != 64:
-                return False, "License verification failed: invalid signature format."
-            r = int.from_bytes(sig_bytes[:32], 'big')
-            s = int.from_bytes(sig_bytes[32:], 'big')
-            der_sig = encode_dss_signature(r, s)
-            pub_key.verify(der_sig, signed_payload_str.encode('utf-8'), ec.ECDSA(hashes.SHA256()))
-
-            payload = json.loads(signed_payload_str)
-            if payload.get("product") not in ("Easy Speech Pro", "Easy Speech"):
-                return False, "This license is not valid for Easy Speech Pro."
-            if payload.get("hwid") != hwid:
-                return False, "This license is already active on another device."
-
-            now_ms = time.time() * 1000
-            exp_str = payload.get("exp")
-            if exp_str:
-                from datetime import datetime
-                exp_clean = exp_str.replace("Z", "+00:00")
-                exp_dt = datetime.fromisoformat(exp_clean)
-                exp_ts_ms = exp_dt.timestamp() * 1000
-                is_trial = payload.get("type") == "trial"
-                grace_ms = 0 if is_trial else 48 * 3600 * 1000
-                if now_ms > (exp_ts_ms + grace_ms):
-                    return False, "License expired. Please renew your Easy Speech Pro license."
-
-            return True, None
-        except Exception as e:
-            return False, f"License verification error: {str(e)}"
+        """Free distribution edition: Local client requests are automatically authorized."""
+        return True, None
 
     def _send_json_response(self, code, payload):
         try:

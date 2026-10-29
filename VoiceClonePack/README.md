@@ -21,7 +21,7 @@ High-fidelity offline AI voice cloning powered by **F5-TTS Diffusion** and **Fas
 Keep the service running (or let Easy Speech auto-spawn it in the background) while using Voice Cloning in your video timeline.
 
 ### Step 3: Clone & Generate in Easy Speech
-1. Open the **Easy Speech** panel in Premiere Pro.
+1. Open the **Easy Speech Pro** panel in Premiere Pro.
 2. Under the voice selection menu, click **🎙️ Cloned** → **➕ Clone New Voice**.
 3. Enter a voice profile name and drop a 5–10 second clean audio clip (WAV, MP3, or M4A).
 4. Review the auto-transcribed reference text.
